@@ -5,16 +5,19 @@ from amqtt.broker import Broker
 import paho.mqtt.client as Client
 
 
-def broker_process(broker_config, available_port):
+def broker_process(broker_config, available_port, enable_logging=False):
     """Run an embedded MQTT broker in its own process."""
-    logger.configure(
-        handlers=[
-            {
-                "sink": lambda msg: print(msg, end=""),
-                "format": "[{time:YYYY-MM-DD HH:mm:ss}] {level} {name}: {message}",
-            }
-        ]
-    )
+    if enable_logging:
+        logger.configure(
+            handlers=[
+                {
+                    "sink": lambda msg: print(msg, end=""),
+                    "format": "[{time:YYYY-MM-DD HH:mm:ss}] {level} {name}: {message}",
+                }
+            ]
+        )
+    else:
+        logger.disable("ghost_coder")
     
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)

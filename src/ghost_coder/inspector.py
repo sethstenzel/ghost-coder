@@ -54,8 +54,20 @@ def on_message(client, userdata, message):
     )
 
 
-def inspector_process(port):
+def inspector_process(port, enable_logging=False):
     """Run an MQTT inspector that logs all messages on all topics."""
+    if enable_logging:
+        logger.configure(
+            handlers=[
+                {
+                    "sink": lambda msg: print(msg, end=""),
+                    "format": "[{time:YYYY-MM-DD HH:mm:ss}] {level} {name}: {message}",
+                }
+            ]
+        )
+    else:
+        logger.disable("ghost_coder")
+
     logger.info(f"Starting inspector on port {port}")
 
     userdata = {"port": port, "reconnect_count": 0, "should_exit": False}

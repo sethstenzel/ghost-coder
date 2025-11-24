@@ -620,16 +620,19 @@ class Listener:
         self.emit("LISTENER", event_data)
 
 
-def listener_process(port: int):
+def listener_process(port: int, enable_logging: bool = False):
     """Run the listener as a separate process."""
-    logger.configure(
-        handlers=[
-            {
-                "sink": lambda msg: print(msg, end=""),
-                "format": "[{time:YYYY-MM-DD HH:mm:ss}] {level} {name}: {message}",
-            }
-        ]
-    )
+    if enable_logging:
+        logger.configure(
+            handlers=[
+                {
+                    "sink": lambda msg: print(msg, end=""),
+                    "format": "[{time:YYYY-MM-DD HH:mm:ss}] {level} {name}: {message}",
+                }
+            ]
+        )
+    else:
+        logger.disable("ghost_coder")
     
     logger.info("Starting Listener process")
     listener = Listener(mqtt_port=port)
