@@ -1,0 +1,7 @@
+            # def update_label():
+            #     UI_REFS['code_editor'].set_content(UI_REFS['file_contents'])
+            #     ui.notify(f'code_editor updated')
+
+
+            # # Timer that fires every 1 second (1.0 seconds)
+            # ui.timer(0.050, update_label)

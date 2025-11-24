@@ -5,7 +5,13 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "amqtt>=0.11.3",
+    "inputs>=0.5",
+    "loguru>=0.7.3",
     "nicegui>=3.3.1",
+    "paho-mqtt>=2.1.0",
     "pyinput>=0.3.2",
+    "pynput>=1.8.1",
     "pywebview>=6.1",
+    "pyzmq>=26.0.0",
 ]
