@@ -47,11 +47,13 @@ class Typer:
         self.paused = False
         self.advance_to_newline = 0
         self.advance_token = 0
+        self.play_in_session = False
+        self.resumed = 0
 
         # Configuration (will be synced from STATE)
-        self.speed = 100
+        self.play_status = "stopped"
+        self.speed = 50
         self.pause_on_new_line = True
-        self.window_title = ""
         self.pause_on_window_not_focused = True
         self.refocus_window_on_resume = True
         self.start_playback_paused = False
@@ -115,10 +117,12 @@ class Typer:
             if message.topic == "STATE":
                 try:
                     state_data = json.loads(payload)
-                    # Update local state cache
-                    if "result" in state_data and isinstance(state_data["result"], dict):
-                        self._state_values.update(state_data["result"])
+                    if "state-data" in state_data and isinstance(state_data["state-data"], dict):
+                        logger.info("Typer received new STATE Data")
+                        self._state_values.update(state_data["state-data"])
+
                         self._sync_from_state()
+                        logger.info("Typer state synced")
                 except json.JSONDecodeError:
                     pass
                 return
@@ -142,8 +146,6 @@ class Typer:
                     self._handle_advance_newline()
                 elif cmd == "advance_token":
                     self._handle_advance_token()
-                elif cmd == "help":
-                    self._handle_help()
                 else:
                     logger.warning(f"Unknown command: {cmd}")
 
@@ -158,18 +160,18 @@ class Typer:
 
         if not file_path:
             error_msg = {"error": "Missing 'file' parameter"}
-            self.emit("UI", error_msg)
+            self.publish("UI", error_msg)
             logger.error("load_file command missing 'file' parameter")
             return
 
         try:
             self.initialize_text_data(file_path)
             result = {"result": "ok", "message": f"Loaded file: {file_path}"}
-            self.emit("TYPER", result)
+            self.publish("TYPER", result)
             logger.info(f"Successfully loaded file: {file_path}")
         except Exception as e:
             error_msg = {"error": f"Failed to load file: {str(e)}"}
-            self.emit("UI", error_msg)
+            self.publish("UI", error_msg)
             logger.error(f"Error loading file {file_path}: {e}")
 
     def _handle_data(self):
@@ -179,39 +181,44 @@ class Typer:
         else:
             result = {"result": [], "warning": "No data loaded"}
 
-        self.emit("TYPER", result)
+        self.publish("TYPER", result)
         logger.debug(f"Sent data with {len(self.text_tokens_preview)} tokens")
 
     def _handle_play(self):
         """Handle play command - start typing."""
         if not self.text_tokens:
             error_msg = {"error": "No data loaded. Use load_file first."}
-            self.emit("TYPER", error_msg)
+            self.publish("TYPER", error_msg)
             logger.error("Cannot play: no data loaded")
             return
 
-        if self.play:
-            logger.warning("Playback already running")
-            return
+        logger.warning("Playback already running")
+        if self.play_in_session:
+            self.play = True
+            self.paused = False
+            self.resumed = 1
+            self._update_play_status("playing")
+        else:
+            self.play = True
+            self.paused = False
 
-        self.play = True
-        self.paused = False
+            # Update play_status state to playing
+            self._update_play_status("playing")
 
-        # Update play_status state to playing
-        self._update_play_status("playing")
+            # Start playback in a separate thread
+            self._playback_thread = threading.Thread(target=self._play_with_delay, daemon=True)
+            self._playback_thread.start()
 
-        # Start playback in a separate thread
-        self._playback_thread = threading.Thread(target=self._play_with_delay, daemon=True)
-        self._playback_thread.start()
-
-        result = {"result": "ok", "message": "Playback will start in 5 seconds"}
-        self.emit("TYPER", result)
-        logger.info("Playback will start in 5 seconds")
+            notify = {"cmd": "notify", "message": "Playback will start in 5 seconds"}
+            self.publish("UI", notify)
+            logger.info("Playback will start in 5 seconds")
 
     def _handle_stop(self):
         """Handle stop command."""
         self.play = False
         self.paused = False
+        self.play_in_session = False
+        self.resumed = 0
 
         # Reset to beginning of file
         self._reset_to_beginning()
@@ -219,8 +226,6 @@ class Typer:
         # Update play_status state to stopped
         self._update_play_status("stopped")
 
-        result = {"result": "ok", "message": "Playback stopped - reset to beginning"}
-        self.emit("TYPER", result)
         logger.info("Stopped playback and reset to beginning")
 
     def _handle_pause(self):
@@ -239,143 +244,40 @@ class Typer:
         self._update_play_status(state)
 
         result = {"result": "ok", "message": f"Playback {state}"}
-        self.emit("TYPER", result)
+        self.publish("TYPER", result)
         logger.info(f"Playback {state}")
 
     def _handle_advance_newline(self):
         """Handle advance_newline command - advance to next newline."""
         self.advance_to_newline += 1
         result = {"result": "ok", "message": "Advancing to next newline"}
-        self.emit("TYPER", result)
+        self.publish("TYPER", result)
         logger.info("Advance to newline triggered")
 
     def _handle_advance_token(self):
         """Handle advance_token command - advance by one token."""
         self.advance_token += 1
         result = {"result": "ok", "message": "Advancing by one token"}
-        self.emit("TYPER", result)
+        self.publish("TYPER", result)
         logger.info("Advance token triggered")
-
-    def _handle_help(self):
-        """Handle help command."""
-        help_details = {
-            "description": "Automated text input simulator with window focus detection",
-            "features": [
-                "Load text files and parse into tokens",
-                "Simulate keyboard and mouse actions",
-                "Window focus detection and auto-pause",
-                "Configurable typing speed and behavior",
-                "State synchronization via STATE topic"
-            ],
-            "commands": {
-                "load_file": {
-                    "description": "Load a text file for typing",
-                    "parameters": {
-                        "cmd": "'load_file' (required)",
-                        "file": "File path to load (required)"
-                    },
-                    "example": {
-                        "cmd": "load_file",
-                        "file": "c:/path/to/file.txt"
-                    }
-                },
-                "data": {
-                    "description": "Get the loaded text tokens preview",
-                    "parameters": {
-                        "cmd": "'data' (required)"
-                    },
-                    "example": {
-                        "cmd": "data"
-                    }
-                },
-                "play": {
-                    "description": "Start typing the loaded text",
-                    "parameters": {
-                        "cmd": "'play' (required)"
-                    },
-                    "example": {
-                        "cmd": "play"
-                    }
-                },
-                "stop": {
-                    "description": "Stop typing",
-                    "parameters": {
-                        "cmd": "'stop' (required)"
-                    },
-                    "example": {
-                        "cmd": "stop"
-                    }
-                },
-                "pause": {
-                    "description": "Toggle pause/resume",
-                    "parameters": {
-                        "cmd": "'pause' (required)"
-                    },
-                    "example": {
-                        "cmd": "pause"
-                    }
-                },
-                "advance_newline": {
-                    "description": "Advance to next newline (when paused)",
-                    "parameters": {
-                        "cmd": "'advance_newline' (required)"
-                    },
-                    "example": {
-                        "cmd": "advance_newline"
-                    }
-                },
-                "advance_token": {
-                    "description": "Advance by one token (when paused)",
-                    "parameters": {
-                        "cmd": "'advance_token' (required)"
-                    },
-                    "example": {
-                        "cmd": "advance_token"
-                    }
-                },
-                "help": {
-                    "description": "Get help information",
-                    "parameters": {
-                        "cmd": "'help' (required)"
-                    },
-                    "example": {
-                        "cmd": "help"
-                    }
-                }
-            },
-            "state_keys": [
-                "speed (int): Typing speed in milliseconds",
-                "pause_on_new_line (bool): Auto-pause on newline",
-                "window_title (str): Target window title",
-                "pause_on_window_not_focused (bool): Auto-pause when window loses focus",
-                "refocus_window_on_resume (bool): Refocus target window when resuming from pause",
-                "start_playback_paused (bool): Start in paused state",
-                "auto_home_on_newline (bool): Press Home key after Enter",
-                "control_on_newline (bool): Press Ctrl+Enter instead of Enter",
-                "replace_quad_spaces_with_tab (bool): Convert 4 spaces to Tab"
-            ],
-            "workflow": [
-                "1. Load a file: {\"cmd\": \"load_file\", \"file\": \"path/to/file.txt\"}",
-                "2. Get data preview: {\"cmd\": \"data\"}",
-                "3. Configure via STATE topic (optional)",
-                "4. Start playback: {\"cmd\": \"play\"}",
-                "5. Pause/resume: {\"cmd\": \"pause\"}",
-                "6. Stop: {\"cmd\": \"stop\"}"
-            ]
-        }
-        help_message = {"info": help_details}
-        self.emit("TYPER", help_message)
-        logger.info("Sent help message to TYPER topic")
 
     def _sync_from_state(self):
         """Sync configuration from STATE values."""
+        if "play_status" in self._state_values:
+            self.play_status = self._state_values["play_status"]
+            if self.play_status == "playing":
+                self.play = True
+                self.paused = False
+            elif self.play_status == "paused":
+                self.play = True
+                self.paused = True
+            else:
+                self.play = False
+                self.paused = False
         if "speed" in self._state_values:
             self.speed = self._state_values["speed"]
         if "pause_on_new_line" in self._state_values:
             self.pause_on_new_line = self._state_values["pause_on_new_line"]
-        if "window_title" in self._state_values:
-            self.window_title = self._state_values["window_title"]
-            self._update_window_handle()
         if "pause_on_window_not_focused" in self._state_values:
             self.pause_on_window_not_focused = self._state_values["pause_on_window_not_focused"]
         if "refocus_window_on_resume" in self._state_values:
@@ -400,20 +302,13 @@ class Typer:
             except Exception as e:
                 logger.error(f"Error getting window handle: {e}")
 
-    def _state_sync_loop(self):
-        """Background thread that periodically requests state updates."""
-        while self._running:
-            if self._mqtt_connected:
-                state_request = {"cmd": "get"}
-                self.emit("STATE", state_request)
-                time.sleep(0.1)
 
     def initialize_text_data(self, file_path: str):
         """Load and parse a text file into tokens."""
         with open(file_path, 'r', encoding='utf-8') as f:
             file_data = f.read()
             text_data = TextData(file_data, replace_quad_spaces_with_tab=self.replace_quad_spaces_with_tab)
-            self.text_tokens = text_data.text_tokens.copy()
+            self.text_tokens = text_data.text_tokens
             self.original_text_tokens = text_data.text_tokens.copy()  # Save original
             self.text_tokens_preview = ['[ ' + str(x) + ' ]' for x in text_data.text_tokens]
             self.current_file_path = file_path  # Save file path
@@ -484,11 +379,14 @@ class Typer:
                     char_completed = False
                     while not char_completed:
                         if (
+                            (self.play and self.resumed > 0) or
                             (self.check_window_focused(pause_if_not=True) and not self.paused) or
                             (self.play and self.paused and self.advance_to_newline > 0) or
                             (self.play and self.paused and self.advance_token > 0)
                         ):
                             self.focus_window()
+                            if self.resumed:
+                                self.resumed = 0
                             kb.press(char)
                             time.sleep(self.speed/1000)
                             kb.release(char)
@@ -505,10 +403,21 @@ class Typer:
 
         # Capture the currently focused window
         self._capture_active_window()
+        if "Ghost Coder" in self.window_title:
+            self.play = False
+            self.paused = False
+            self.play_status = "stopped"
+            logger.error("Focus window is Ghost Coder... no new window was given focus, please")
 
+            state_msg = {"cmd": "update_state", "key": "play_status", "value": self.play_status}
+            self.publish("STATE", state_msg)
+            logger.debug(f"Updated play_status to '{self.play_status}'")
+
+            notify = {"notify": "Focus window is Ghost Coder... no new window was given focus."}
+            self.publish("UI", notify)
+            
+            
         logger.info("Starting playback now")
-        result = {"result": "ok", "message": "Playback started"}
-        self.emit("TYPER", result)
         self.type_text_tokens()
 
     def _capture_active_window(self):
@@ -528,6 +437,7 @@ class Typer:
 
     def type_text_tokens(self):
         """Type all loaded text tokens."""
+        self.play_in_session = True
         self.focus_window()
         if self.start_playback_paused:
             self.paused = True
@@ -541,11 +451,16 @@ class Typer:
                     (self.play and self.paused and self.advance_to_newline > 0) or
                     (self.play and self.paused and self.advance_token > 0)
                 ):
-                    if (not self.paused and self.check_window_focused(pause_if_not=True) or
+                    if (
+                        (self.play and self.resumed > 0) or
+                        (not self.paused and self.check_window_focused(pause_if_not=True)) or
                         (self.play and self.paused and self.advance_to_newline > 0) or
                         (self.play and self.paused and self.advance_token > 0)
+                        
                     ):
                         self.focus_window()
+                        if self.resumed:
+                            self.resumed = 0
                         token_completed = self.type_token(token)
                         if token_completed and self.advance_token > 0:
                             self.advance_token -= 1
@@ -563,25 +478,30 @@ class Typer:
         # Playback finished
         self.play = False
         self.paused = False
+        self.play_in_session = False
 
         # Update play_status state to stopped
         self._update_play_status("stopped")
-
-        result = {"result": "ok", "message": "Playback finished"}
-        self.emit("TYPER", result)
         logger.info("Playback finished")
 
     def check_window_focused(self, pause_if_not=False):
-        """Check if target window is focused."""
+        """Check if target window is focused.
+
+        When window focus changes and auto-pause is enabled, updates both
+        local state and publishes the change to the STATE process.
+        """
         if not self.hwnd or not self.pause_on_window_not_focused:
             return True
 
         active_window = gw.getActiveWindow()
         if not active_window or active_window._hWnd != self.hwnd:
-            if pause_if_not:
+            if pause_if_not and not self.paused and not self.play_status == "stopped":
+                # Update local state first
                 self.paused = True
-                # Update play_status state to paused
+
+                # Publish play_status update to STATE process
                 self._update_play_status("paused")
+                logger.info("Window focus lost - paused playback and updated STATE")
             return False
         return True
 
@@ -595,7 +515,7 @@ class Typer:
             except Exception as e:
                 logger.debug(f"Error focusing window: {e}")
 
-    def emit(self, topic: str, data: Dict[str, Any]):
+    def publish(self, topic: str, data: Dict[str, Any]):
         """Emit a message via MQTT."""
         if self._mqtt_connected:
             message = json.dumps(data)
@@ -603,8 +523,8 @@ class Typer:
 
     def _update_play_status(self, status: str):
         """Update the play_status state."""
-        state_msg = {"cmd": "add", "key": "play_status", "value": status, "type": "str"}
-        self.emit("STATE", state_msg)
+        state_msg = {"cmd": "update_state", "key": "play_status", "value": status}
+        self.publish("STATE", state_msg)
         logger.debug(f"Updated play_status to '{status}'")
 
     def _reset_to_beginning(self):
@@ -634,10 +554,6 @@ class Typer:
             self._running = False
             return
 
-        # Start state sync thread
-        self._state_sync_thread = threading.Thread(target=self._state_sync_loop, daemon=True)
-        self._state_sync_thread.start()
-
     def stop(self):
         """Stop the Typer."""
         if not self._running:
@@ -658,7 +574,7 @@ class Typer:
         return self._running
 
 
-def typer_process(port: int, enable_logging: bool = False):
+def typer_process(port: int, enable_logging: bool = True):
     """Run the typer as a separate process."""
     if enable_logging:
         logger.configure(
@@ -685,3 +601,7 @@ def typer_process(port: int, enable_logging: bool = False):
     finally:
         typer.stop()
         logger.info("Typer stopped")
+
+
+if __name__ == "__main__":
+    typer_process(55555)

@@ -5,7 +5,17 @@ from amqtt.broker import Broker
 import paho.mqtt.client as Client
 
 
-def broker_process(broker_config, available_port, enable_logging=False):
+def broker_process(available_port, enable_logging=True):
+
+    broker_config = {
+        "listeners": {
+            "default": {
+                "type": "tcp",
+                "bind": f"127.0.0.1:{available_port}",
+            }
+        },
+    }
+
     """Run an embedded MQTT broker in its own process."""
     if enable_logging:
         logger.configure(
@@ -78,3 +88,6 @@ def broker_process(broker_config, available_port, enable_logging=False):
         loop.run_until_complete(broker.shutdown())
         loop.close()
         logger.info("Broker Stopped")
+
+if __name__ == "__main__":
+    broker_process(55555)

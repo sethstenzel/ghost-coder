@@ -30,7 +30,17 @@ class StateManager:
             mqtt_port: Port for MQTT broker connection
         """
         # State storage
-        self._state: Dict[str, Any] = {}
+        self._state: Dict[str, Any] = {
+            'play_status': 'stopped',
+            'typing_speed_value': 50,
+            'pause_on_new_line': False,
+            'start_playback_paused': False,
+            'auto_home_on_newline': True,
+            'control_on_newline': True,
+            'replace_quad_spaces_with_tab': True,
+            'pause_on_window_not_focused': True,
+            'refocus_window_on_resume': True,
+        }
 
         # MQTT setup
         self._mqtt_port = mqtt_port
