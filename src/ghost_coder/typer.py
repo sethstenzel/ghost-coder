@@ -345,6 +345,9 @@ class Typer:
                         kb.release(getattr(Key, token.key))
                         kb.release(Key.ctrl)
                     elif token.key == "atpause":
+                        # <<PAUSE>> should always pause and consume advance_to_newline
+                        if self.advance_to_newline > 0:
+                            self.advance_to_newline -= 1
                         self.paused = True
                         self._update_play_status("paused")
                     else:
