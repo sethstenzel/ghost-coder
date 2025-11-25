@@ -383,6 +383,15 @@ class Listener:
         with self._lock:
             # Check if we're recording
             if self._recording_slot and self._recording_source == InputSource.KEYBOARD:
+                # Reject escape key silently - it's reserved for canceling
+                if key_str == 'esc':
+                    logger.info(f"Escape key rejected for slot {self._recording_slot} - reserved for canceling")
+                    self._recording_slot = None
+                    self._recording_source = None
+                    self._recording_message = None
+                    self._recording_suppress = False
+                    return
+
                 hotkey = HotkeyEvent(
                     slot=self._recording_slot,
                     source=InputSource.KEYBOARD,

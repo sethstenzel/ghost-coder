@@ -35,7 +35,13 @@ UI_ELEMENTS = {
     'control_on_newline': None,
     'replace_quad_spaces_with_tab': None,
     'pause_on_window_not_focused': None,
-    'refocus_window_on_resume': None
+    'refocus_window_on_resume': None,
+    'hotkey_labels': {
+        1: None,  # play_button label
+        2: None,  # stop_button label
+        3: None,  # advance_to_next_newline_button label
+        4: None   # advance_to_next_token_button label
+    }
 }
 
 APP_STATE = {
@@ -50,7 +56,13 @@ APP_STATE = {
     'refocus_window_on_resume': True,
     'source_file_path': '',
     'loaded_file_data': '',
-    'loaded_file_parsed_data': ''
+    'loaded_file_parsed_data': '',
+    'hotkeys': {
+        1: None,  # play_button
+        2: None,  # stop_button
+        3: None,  # advance_to_next_newline_button
+        4: None   # advance_to_next_token_button
+    }
 }
 
 # MQTT setup
@@ -77,8 +89,8 @@ def on_mqtt_connect(client, userdata, flags, rc, properties=None):
     """Callback when MQTT client connects to broker."""
     if rc == 0:
         logger.info(f"UI connected to MQTT broker on port {userdata['port']}")
-        client.subscribe([("UI", 1), ("APP", 1), ("STATE", 1)])
-        logger.info("UI subscribed to topics: UI, APP, STATE")
+        client.subscribe([("UI", 1), ("APP", 1), ("STATE", 1), ("LISTENER", 1)])
+        logger.info("UI subscribed to topics: UI, APP, STATE, LISTENER")
     else:
         logger.error(f"UI failed to connect to MQTT broker, return code: {rc}")
 
@@ -91,20 +103,20 @@ def check_mqtt_messages():
     """Process MQTT messages from the queue."""
     while not mqtt_queue.empty():
         topic, payload = mqtt_queue.get()
-        
+
         # Parse JSON payload
         try:
             data = json.loads(payload)
         except json.JSONDecodeError:
             logger.warning(f"Received non-JSON message on {topic}: {payload}")
             continue
-        
+
         # Handle APP topic messages
         if topic == "APP":
             if data.get("cmd") == "CLOSE":
                 logger.info("UI received CLOSE command, shutting down")
                 app.shutdown()
-        
+
         # Handle UI topic messages
         elif topic == "UI":
             if data.get("notify"):
@@ -121,6 +133,27 @@ def check_mqtt_messages():
                 if key in APP_STATE.keys():
                     APP_STATE[key] = value
                     state_changed()
+
+        # Handle LISTENER topic messages
+        elif topic == "LISTENER":
+            event = data.get("event")
+            if event == "hotkey_triggered":
+                slot = data.get("slot")
+                logger.info(f"Hotkey {slot} triggered")
+                handle_hotkey_trigger(slot)
+            elif "info" not in data:  # Not a help message
+                # Hotkey registration confirmation (no explicit event)
+                # Update local state when we receive slot/source/value
+                slot = data.get("slot")
+                source = data.get("source")
+                value = data.get("value")
+                if slot and source and value:
+                    APP_STATE['hotkeys'][slot] = {
+                        'source': source,
+                        'value': value
+                    }
+                    update_hotkey_labels()
+                    logger.info(f"Updated hotkey {slot}: {source} - {value}")
 
 
 
@@ -315,14 +348,140 @@ def on_advance_token_button():
         logger.warning("MQTT client not connected")
 
 
+def show_hotkey_dialog(slot: int, button_name: str):
+    """Show a dialog to configure a hotkey for the given slot."""
+    # Track if we're waiting for a hotkey input
+    waiting_for_input = {'active': False}
+
+    def handle_escape():
+        """Handle escape key press during hotkey registration."""
+        if waiting_for_input['active']:
+            # Cancel the hotkey registration
+            if mqtt_client and mqtt_client.is_connected():
+                # Send a dummy unregister to cancel recording state in listener
+                cancel_msg = json.dumps({
+                    "cmd": "unregister",
+                    "slot": slot
+                })
+                mqtt_client.publish("LISTENER", cancel_msg, qos=1)
+                logger.info(f"Cancelled hotkey registration for slot {slot}")
+            ui.notify("Hotkey registration cancelled")
+            waiting_for_input['active'] = False
+
+    def set_hotkey_wrapper(input_type: str):
+        """Wrapper to track when we're waiting for input."""
+        waiting_for_input['active'] = True
+        set_hotkey(slot, input_type, dialog)
+
+    with ui.dialog() as dialog, ui.card():
+        ui.label(f'Configure Hotkey for {button_name}').classes('text-lg font-bold')
+        ui.separator()
+
+        with ui.column().classes('gap-2'):
+            ui.button('Keyboard Hotkey',
+                     icon='keyboard',
+                     on_click=lambda: set_hotkey_wrapper('keyboard')).classes('w-full')
+            ui.button('Mouse Hotkey',
+                     icon='mouse',
+                     on_click=lambda: set_hotkey_wrapper('mouse')).classes('w-full')
+            ui.button('Gamepad Hotkey',
+                     icon='sports_esports',
+                     on_click=lambda: set_hotkey_wrapper('gamepad')).classes('w-full')
+            ui.button('Clear Hotkey',
+                     icon='clear',
+                     on_click=lambda: clear_hotkey(slot, dialog)).classes('w-full')
+            ui.separator()
+            ui.button('Cancel (or press ESC)',
+                     icon='close',
+                     on_click=lambda: [dialog.close(), (handle_escape() if waiting_for_input['active'] else None)]).classes('w-full')
+
+        # Add keyboard handler for escape key
+        dialog.on('keydown.esc', lambda: [handle_escape(), dialog.close()])
+
+    dialog.open()
+
+def set_hotkey(slot: int, input_type: str, dialog):
+    """Send MQTT command to register a hotkey."""
+    if mqtt_client and mqtt_client.is_connected():
+        register_msg = json.dumps({
+            "cmd": "register",
+            "slot": slot,
+            "input": input_type,
+            "suppress": False
+        })
+        mqtt_client.publish("LISTENER", register_msg, qos=1)
+        logger.info(f"Sent register command for slot {slot} with input {input_type}")
+        ui.notify(f"Press/click the {input_type} input now to register hotkey...")
+        dialog.close()
+    else:
+        logger.warning("MQTT client not connected")
+        ui.notify("MQTT not connected", type='negative')
+        dialog.close()
+
+def clear_hotkey(slot: int, dialog):
+    """Clear the hotkey for the given slot."""
+    if mqtt_client and mqtt_client.is_connected():
+        unregister_msg = json.dumps({
+            "cmd": "unregister",
+            "slot": slot
+        })
+        mqtt_client.publish("LISTENER", unregister_msg, qos=1)
+        logger.info(f"Sent unregister command for slot {slot}")
+
+        # Update local state
+        APP_STATE['hotkeys'][slot] = None
+        update_hotkey_labels()
+
+        ui.notify(f"Hotkey cleared")
+        dialog.close()
+    else:
+        logger.warning("MQTT client not connected")
+        ui.notify("MQTT not connected", type='negative')
+        dialog.close()
+
+def update_hotkey_labels():
+    """Update the hotkey label displays."""
+    hotkey_names = {
+        1: "Play | Pause | Resume",
+        2: "Stop",
+        3: "Adv. to newline",
+        4: "Adv. Token"
+    }
+
+    for slot, label in UI_ELEMENTS['hotkey_labels'].items():
+        if label:
+            hotkey_info = APP_STATE['hotkeys'].get(slot)
+            if hotkey_info:
+                source = hotkey_info.get('source', '').capitalize()
+                value = hotkey_info.get('value', '')
+                label.set_text(f"{hotkey_names[slot]}: [{source}: {value}]")
+            else:
+                label.set_text(f"{hotkey_names[slot]}: []")
+
 def play_button_set_hotkey(e):
-    pass
+    show_hotkey_dialog(1, "Play/Pause/Resume")
+
 def stop_button_set_hotkey(e):
-    pass
+    show_hotkey_dialog(2, "Stop")
+
 def advance_to_next_newline_button_set_hotkey(e):
-    pass
+    show_hotkey_dialog(3, "Advance to Newline")
+
 def advance_to_next_token_button_set_hotkey(e):
-    pass
+    show_hotkey_dialog(4, "Advance to Token")
+
+def handle_hotkey_trigger(slot: int):
+    """Handle a hotkey trigger event from the listener."""
+    if slot == 1:  # Play/Pause/Resume
+        toggle_playback()
+    elif slot == 2:  # Stop
+        stop_playback()
+    elif slot == 3:  # Advance to newline
+        on_advance_newline_button()
+    elif slot == 4:  # Advance to token
+        on_advance_token_button()
+    else:
+        logger.warning(f"Unknown hotkey slot: {slot}")
 
 
 
@@ -379,7 +538,7 @@ def build_ui():
                 UI_ELEMENTS['stop_button'].on('contextmenu', stop_button_set_hotkey)
                 UI_ELEMENTS['advance_to_next_newline_button'] = ui.button("ADV. NEWLINE", icon='fast_forward', on_click=on_advance_newline_button)
                 UI_ELEMENTS['advance_to_next_newline_button'].disable()
-                UI_ELEMENTS['advance_to_next_newline_button'].on('contextmenu', advance_to_next_token_button_set_hotkey)
+                UI_ELEMENTS['advance_to_next_newline_button'].on('contextmenu', advance_to_next_newline_button_set_hotkey)
                 UI_ELEMENTS['advance_to_next_token_button'] = ui.button("ADV. TOKEN", icon='fast_forward', on_click=on_advance_token_button)
                 UI_ELEMENTS['advance_to_next_token_button'].disable()
                 UI_ELEMENTS['advance_to_next_token_button'].on('contextmenu', advance_to_next_token_button_set_hotkey)
@@ -390,11 +549,11 @@ def build_ui():
 
             with ui.row().classes('w-full'):
                 with ui.column().style("width:48.5%;"):
-                    ui.label("Play | Pause | Resume: []").classes('font-bold').style()
-                    ui.label("Stop: []").classes('font-bold')
+                    UI_ELEMENTS['hotkey_labels'][1] = ui.label("Play | Pause | Resume: []").classes('font-bold').style()
+                    UI_ELEMENTS['hotkey_labels'][2] = ui.label("Stop: []").classes('font-bold')
                 with ui.column().style("width:48.5%;"):
-                    ui.label("Adv. Token: []").classes('font-bold')
-                    ui.label("Adv. to newline: []").classes('font-bold')
+                    UI_ELEMENTS['hotkey_labels'][4] = ui.label("Adv. Token: []").classes('font-bold')
+                    UI_ELEMENTS['hotkey_labels'][3] = ui.label("Adv. to newline: []").classes('font-bold')
 
 
 def main():
@@ -431,9 +590,9 @@ def main():
     time.sleep(1)
 
     # Start listener process
-    # logger.info("Starting listener process")
-    # child_processes["listener"] = mp.Process(target=listener_process, args=(available_port, args.logging), name="listener")
-    # child_processes["listener"].start()
+    logger.info("Starting listener process")
+    child_processes["listener"] = mp.Process(target=listener_process, args=(available_port, args.logging), name="listener")
+    child_processes["listener"].start()
 
     # Start typer process
     logger.info("Starting typer process")
