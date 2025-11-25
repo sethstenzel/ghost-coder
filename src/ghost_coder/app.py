@@ -596,11 +596,16 @@ def main():
                     "rotation": "10 MB",
                     "retention": "7 days",
                     "level": "DEBUG"
+                },
+                {
+                    "sink": lambda msg: print(msg, end=""),
+                    "format": "[{time:YYYY-MM-DD HH:mm:ss}] {level} {name}:{function}:{line} - {message}",
+                    "level": "DEBUG"
                 }
             ]
         )
         logger.enable("ghost_coder")
-        logger.info("Logging enabled - writing to ghost_coder.log")
+        logger.info("Logging enabled - writing to ghost_coder.log and console")
     else:
         logger.disable("ghost_coder")
 

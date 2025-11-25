@@ -6,7 +6,7 @@ Listens for commands on MQTT TYPER topic and monitors STATE for configuration.
 import time
 import json
 import threading
-from ghost_coder.data import SingleKey, MultiKeys, TimedPause, MouseScroll, TextData
+from ghost_coder.data import SingleKey, MultiKeys, TimedPause, MouseScroll, RepeatedKey, TextData
 from pynput.keyboard import Key
 from pynput.keyboard import Controller as KbController
 from pynput.mouse import Controller as MsController
@@ -374,6 +374,15 @@ class Typer:
                         ms.scroll(0, token.scroll_direction)
                         time.sleep(self.speed/1000/2)
                     token_completed = True
+            elif isinstance(token, RepeatedKey):
+                if self.check_window_focused(pause_if_not=True):
+                    self.focus_window()
+                    for _ in range(token.count):
+                        kb.press(getattr(Key, token.key))
+                        time.sleep(self.speed/1000)
+                        kb.release(getattr(Key, token.key))
+                        time.sleep(self.speed/1000/4)  # Small delay between repeated presses
+                    token_completed = True
             else:
                 for char in token:
                     char_completed = False
@@ -584,6 +593,11 @@ def typer_process(port: int, enable_logging: bool = True):
                     "format": "[{time:YYYY-MM-DD HH:mm:ss}] {level} {name}:{function}:{line} - {message}",
                     "rotation": "10 MB",
                     "retention": "7 days",
+                    "level": "DEBUG"
+                },
+                {
+                    "sink": lambda msg: print(msg, end=""),
+                    "format": "[{time:YYYY-MM-DD HH:mm:ss}] {level} {name}:{function}:{line} - {message}",
                     "level": "DEBUG"
                 }
             ]

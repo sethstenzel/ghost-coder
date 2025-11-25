@@ -717,6 +717,11 @@ def listener_process(port: int, enable_logging: bool = False):
                     "rotation": "10 MB",
                     "retention": "7 days",
                     "level": "DEBUG"
+                },
+                {
+                    "sink": lambda msg: print(msg, end=""),
+                    "format": "[{time:YYYY-MM-DD HH:mm:ss}] {level} {name}:{function}:{line} - {message}",
+                    "level": "DEBUG"
                 }
             ]
         )

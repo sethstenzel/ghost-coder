@@ -26,6 +26,11 @@ def broker_process(available_port, enable_logging=True):
                     "rotation": "10 MB",
                     "retention": "7 days",
                     "level": "DEBUG"
+                },
+                {
+                    "sink": lambda msg: print(msg, end=""),
+                    "format": "[{time:YYYY-MM-DD HH:mm:ss}] {level} {name}:{function}:{line} - {message}",
+                    "level": "DEBUG"
                 }
             ]
         )
