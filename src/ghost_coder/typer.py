@@ -6,6 +6,7 @@ Listens for commands on MQTT TYPER topic and monitors STATE for configuration.
 import time
 import json
 import threading
+import random
 from ghost_coder.data import SingleKey, MultiKeys, TimedPause, MouseScroll, RepeatedKey, TextData
 from pynput.keyboard import Key
 from pynput.keyboard import Controller as KbController
@@ -60,6 +61,7 @@ class Typer:
         self.auto_home_on_newline = False
         self.control_on_newline = False
         self.replace_quad_spaces_with_tab = True
+        self.varied_coding_speed = False
 
         # Window handle
         self.hwnd = None
@@ -290,6 +292,8 @@ class Typer:
             self.control_on_newline = self._state_values["control_on_newline"]
         if "replace_quad_spaces_with_tab" in self._state_values:
             self.replace_quad_spaces_with_tab = self._state_values["replace_quad_spaces_with_tab"]
+        if "varied_coding_speed" in self._state_values:
+            self.varied_coding_speed = self._state_values["varied_coding_speed"]
 
     def _update_window_handle(self):
         """Update the window handle based on window_title."""
@@ -313,11 +317,25 @@ class Typer:
             self.text_tokens_preview = ['[ ' + str(x) + ' ]' for x in text_data.text_tokens]
             self.current_file_path = file_path  # Save file path
 
+    def get_typing_speed(self):
+        """Get the typing speed with optional random variation.
+
+        Returns the base speed with random variation of -50ms to +150ms if varied_coding_speed is enabled.
+        """
+        if self.varied_coding_speed:
+            # Random variation between -50ms and +150ms
+            variation = random.randint(-50, 150)
+            varied_speed = max(1, self.speed + variation)  # Ensure speed is at least 1ms
+            return varied_speed
+        return self.speed
+
     def type_token(self, token):
         """Type a single token."""
         kb = self.kb
         ms = self.ms
         token_completed = False
+        # Get typing speed once per token for consistent timing within the token
+        typing_speed = self.get_typing_speed()
 
         while not token_completed and self.play:
             if isinstance(token, MultiKeys):
@@ -328,7 +346,7 @@ class Typer:
                             kb.press(getattr(Key, key))
                         else:
                             kb.press(key)
-                    time.sleep(self.speed/1000/2)
+                    time.sleep(typing_speed/1000/2)
                     for key in token.keys:
                         self.focus_window()
                         if hasattr(Key, key):
@@ -341,7 +359,7 @@ class Typer:
                     if token.key == "enter" and self.control_on_newline:
                         kb.press(Key.ctrl)
                         kb.press(getattr(Key, token.key))
-                        time.sleep(self.speed/1000)
+                        time.sleep(typing_speed/1000)
                         kb.release(getattr(Key, token.key))
                         kb.release(Key.ctrl)
                     elif token.key == "atpause":
@@ -352,12 +370,12 @@ class Typer:
                         self._update_play_status("paused")
                     else:
                         kb.press(getattr(Key, token.key))
-                        time.sleep(self.speed/1000)
+                        time.sleep(typing_speed/1000)
                         kb.release(getattr(Key, token.key))
 
                     if token.key == "enter" and self.auto_home_on_newline:
                         kb.press(Key.home)
-                        time.sleep(self.speed/1000)
+                        time.sleep(typing_speed/1000)
                         kb.release(Key.home)
 
                     if (token.key == "enter" and self.pause_on_new_line) or (token.key == "enter" and self.advance_to_newline > 0):
@@ -375,16 +393,16 @@ class Typer:
                 if self.check_window_focused(pause_if_not=True):
                     for _ in range(token.scroll_count):
                         ms.scroll(0, token.scroll_direction)
-                        time.sleep(self.speed/1000/2)
+                        time.sleep(typing_speed/1000/2)
                     token_completed = True
             elif isinstance(token, RepeatedKey):
                 if self.check_window_focused(pause_if_not=True):
                     self.focus_window()
                     for _ in range(token.count):
                         kb.press(getattr(Key, token.key))
-                        time.sleep(self.speed/1000)
+                        time.sleep(typing_speed/1000)
                         kb.release(getattr(Key, token.key))
-                        time.sleep(self.speed/1000/4)  # Small delay between repeated presses
+                        time.sleep(typing_speed/1000/4)  # Small delay between repeated presses
                     token_completed = True
             else:
                 for char in token:
@@ -400,7 +418,7 @@ class Typer:
                             if self.resumed:
                                 self.resumed = 0
                             kb.press(char)
-                            time.sleep(self.speed/1000)
+                            time.sleep(typing_speed/1000)
                             kb.release(char)
                             char_completed = True
                         time.sleep(0.01)

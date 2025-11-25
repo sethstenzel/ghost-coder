@@ -3,6 +3,8 @@ import multiprocessing as mp
 import multiprocessing
 import argparse
 import time
+import os
+import subprocess
 from loguru import logger
 from nicegui import ui, app
 from queue import Queue
@@ -18,6 +20,7 @@ APP_VERSION = "0.1.0"
 UI_ELEMENTS = {
     'source_file_path_field': None,
     'select_source_file_button': None,
+    'open_folder_button': None,
     'play_button': None,
     'stop_button': None,
     'advance_to_next_newline_button': None,
@@ -50,6 +53,7 @@ APP_STATE = {
     'replace_quad_spaces_with_tab': True,
     'pause_on_window_not_focused': True,
     'refocus_window_on_resume': True,
+    'varied_coding_speed': False,
     'source_file_path': '',
     'loaded_file_data': '',
     'loaded_file_parsed_data': '',
@@ -234,6 +238,10 @@ async def open_native_file_dialog():
         ui.notify(f'File chosen: {path}')
         UI_ELEMENTS['play_button'].enable()
 
+        # Enable the open folder button
+        if UI_ELEMENTS['open_folder_button']:
+            UI_ELEMENTS['open_folder_button'].enable()
+
         try:
             # Read and display file contents in UI
             with open(path, 'r', encoding='utf-8') as fc:
@@ -255,6 +263,27 @@ async def open_native_file_dialog():
         except Exception as e:
             ui.notify(f'Error loading file: {e}', type='negative')
             logger.error(f'Error loading file {path}: {e}')
+
+def open_source_folder():
+    """Open the folder containing the source file in Windows Explorer."""
+    source_path = APP_STATE.get('source_file_path')
+
+    if not source_path:
+        ui.notify("No source file loaded", type='warning')
+        logger.warning("Attempted to open folder but no source file is loaded")
+        return
+
+    try:
+        # Get the directory containing the file
+        folder_path = os.path.dirname(os.path.abspath(source_path))
+
+        # Open the folder in Windows Explorer
+        subprocess.Popen(f'explorer "{folder_path}"')
+        logger.info(f"Opened folder in Explorer: {folder_path}")
+        ui.notify(f"Opened folder: {folder_path}")
+    except Exception as e:
+        ui.notify(f'Error opening folder: {e}', type='negative')
+        logger.error(f'Error opening folder for {source_path}: {e}')
 
 # UI callback functions
 def update_slider_label(e):
@@ -299,6 +328,11 @@ def toggle_refocus_on_resume(e):
     APP_STATE['refocus_window_on_resume'] = e.value
     publish_app_state()
     # Publish to STATE topic
+
+def toggle_varied_coding_speed(e):
+    logger.debug(f"Varied coding speed: {e.value}")
+    APP_STATE['varied_coding_speed'] = e.value
+    publish_app_state()
 
 def toggle_playback():
     current_status = APP_STATE.get('play_status')
@@ -521,11 +555,18 @@ def build_ui():
 
             ui.label("Source File to Play:").classes('font-bold')
             UI_ELEMENTS['file_input'] = ui.input(value='').props('readonly').classes('w-full')
-            UI_ELEMENTS['select_source_file_button'] = ui.button(
-                'Select Source File To Play',
-                icon='file_open',
-                on_click=open_native_file_dialog
-            )
+            with ui.row():
+                UI_ELEMENTS['select_source_file_button'] = ui.button(
+                    'Select Source File To Play',
+                    icon='file_open',
+                    on_click=open_native_file_dialog
+                )
+                UI_ELEMENTS['open_folder_button'] = ui.button(
+                    'Open Folder',
+                    icon='folder_open',
+                    on_click=open_source_folder
+                )
+                UI_ELEMENTS['open_folder_button'].disable()
 
             ui.separator().style("")
 
@@ -544,6 +585,7 @@ def build_ui():
                 UI_ELEMENTS["pause_on_window_not_focused"] = ui.checkbox("Pause Playback On App Focus Change", value=True, on_change=toggle_pause_on_app_change)
             with ui.row():
                 UI_ELEMENTS["refocus_window_on_resume"] = ui.checkbox("Refocus Window On Resume", value=True, on_change=toggle_refocus_on_resume)
+                UI_ELEMENTS["varied_coding_speed"] = ui.checkbox("Varied Coding Speed", value=False, on_change=toggle_varied_coding_speed)
 
             ui.separator().style("height:0.175rem;")
 
@@ -692,6 +734,7 @@ def main():
         native=True,
         window_size=(1600, 900),
         reload=False,
+        port=48888
     )
 
 if __name__ in "__main__":

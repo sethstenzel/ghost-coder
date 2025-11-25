@@ -140,12 +140,28 @@ class TextData():
             count = int(end_match.group(1)) if end_match.group(1) else 1
             return RepeatedKey(key="end", count=count)
 
+        # Check for tab key commands: <<TAB>> or <<TAB=N>>
+        tab_match = re.search(r"<<TAB(?:=(\d+))?>>", string_token, re.IGNORECASE)
+        if tab_match:
+            count = int(tab_match.group(1)) if tab_match.group(1) else 1
+            return RepeatedKey(key="tab", count=count)
+
+        # Check for escape key commands: <<ESC>> or <<ESCAPE>>
+        if re.search(r"<<ESC(?:APE)?>>", string_token, re.IGNORECASE):
+            return SingleKey(key="esc")
+
+        # Check for enter key commands: <<ENTER>>
+        if re.search(r"<<ENTER>>", string_token, re.IGNORECASE):
+            return SingleKey(key="enter")
+
         # Check for general key patterns (must come last to avoid conflicts)
         key_match = re.search(r"<<([a-zA-Z0-9+]+)>>", string_token)
         if key_match:
             keys = tuple(key_match.group(1).split('+'))
             if len(keys) == 1:
-                return SingleKey(key=keys[0])
-            return MultiKeys(keys=keys)
+                # Normalize key name to lowercase for pynput compatibility
+                return SingleKey(key=keys[0].lower())
+            # Normalize all keys in multi-key combinations to lowercase
+            return MultiKeys(keys=tuple(k.lower() for k in keys))
 
         raise ValueError("Invalid format")
