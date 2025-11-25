@@ -21,11 +21,15 @@ def broker_process(available_port, enable_logging=True):
         logger.configure(
             handlers=[
                 {
-                    "sink": lambda msg: print(msg, end=""),
-                    "format": "[{time:YYYY-MM-DD HH:mm:ss}] {level} {name}: {message}",
+                    "sink": "ghost_coder.log",
+                    "format": "[{time:YYYY-MM-DD HH:mm:ss}] {level} {name}:{function}:{line} - {message}",
+                    "rotation": "10 MB",
+                    "retention": "7 days",
+                    "level": "DEBUG"
                 }
             ]
         )
+        logger.enable("ghost_coder")
     else:
         logger.disable("ghost_coder")
     

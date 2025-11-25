@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "amqtt>=0.11.3",
+    "auto-py-to-exe>=2.48.1",
     "inputs>=0.5",
     "loguru>=0.7.3",
     "nicegui>=3.3.1",

@@ -1,5 +1,6 @@
 import json
 import multiprocessing as mp
+import multiprocessing
 import argparse
 import time
 from loguru import logger
@@ -13,12 +14,6 @@ from ghost_coder.typer import typer_process
 
 
 APP_VERSION = "0.1.0"
-logger.configure(
-    handlers=[{
-            "sink": lambda msg: print(msg, end=""),
-            "format": "[{time:YYYY-MM-DD HH:mm:ss}] {level} {name}: {message}"
-    }]
-)
 
 UI_ELEMENTS = {
     'source_file_path_field': None,
@@ -36,6 +31,7 @@ UI_ELEMENTS = {
     'replace_quad_spaces_with_tab': None,
     'pause_on_window_not_focused': None,
     'refocus_window_on_resume': None,
+    'source_code_display': None,
     'hotkey_labels': {
         1: None,  # play_button label
         2: None,  # stop_button label
@@ -141,8 +137,25 @@ def check_mqtt_messages():
                 slot = data.get("slot")
                 logger.info(f"Hotkey {slot} triggered")
                 handle_hotkey_trigger(slot)
+            elif event == "hotkey_registered":
+                # Handle hotkey registration confirmation
+                slot = data.get("slot")
+                source = data.get("source")
+                value = data.get("value")
+                gamepad_name = data.get("gamepad_name")
+
+                if slot and source and value:
+                    APP_STATE['hotkeys'][slot] = {
+                        'source': source,
+                        'value': value
+                    }
+                    if gamepad_name:
+                        APP_STATE['hotkeys'][slot]['gamepad_name'] = gamepad_name
+                    update_hotkey_labels()
+                    logger.info(f"Hotkey registered for slot {slot}: {source} - {value}")
+                    ui.notify(f"Hotkey registered: {source.capitalize()} - {value}")
             elif "info" not in data:  # Not a help message
-                # Hotkey registration confirmation (no explicit event)
+                # Hotkey registration confirmation (no explicit event) - legacy support
                 # Update local state when we receive slot/source/value
                 slot = data.get("slot")
                 source = data.get("source")
@@ -226,6 +239,11 @@ async def open_native_file_dialog():
             with open(path, 'r', encoding='utf-8') as fc:
                 APP_STATE['loaded_file_data'] = fc.read()
             APP_STATE["source_file_path"] = path
+
+            # Update the code display
+            if UI_ELEMENTS['source_code_display']:
+                UI_ELEMENTS['source_code_display'].set_content(APP_STATE['loaded_file_data'])
+
             # Send load_file command to typer process
             if mqtt_client and mqtt_client.is_connected():
                 load_msg = json.dumps({"cmd": "load_file", "file": path})
@@ -489,10 +507,11 @@ def handle_hotkey_trigger(slot: int):
 def build_ui():
     """Build the main UI layout."""
     ui.timer(0.01, check_mqtt_messages)
-    
+
 
     with ui.row().classes('w-full').style('position: relative; gap: 0;'):
-        with ui.column().classes('p-4').style('gap: 0.1rem; flex: 1;'):
+        # Left pane - Controls
+        with ui.column().classes('p-4').style('gap: 0.1rem; width: 45%;'):
             ui.label("How to use this App:").classes('font-bold text-xl')
             ui.label("1. Select the source code file to play back")
             ui.label("2. Adjust playback speed and settings")
@@ -555,6 +574,11 @@ def build_ui():
                     UI_ELEMENTS['hotkey_labels'][4] = ui.label("Adv. Token: []").classes('font-bold')
                     UI_ELEMENTS['hotkey_labels'][3] = ui.label("Adv. to newline: []").classes('font-bold')
 
+        # Right pane - Source code display
+        with ui.column().classes('p-4').style('width: 55%; border-left: 2px solid #ccc;'):
+            ui.label("Source Code Preview:").classes('font-bold text-xl')
+            UI_ELEMENTS['source_code_display'] = ui.code('').classes('w-full').style('max-height: 800px; overflow: auto; font-size: 12px;')
+
 
 def main():
     parser = argparse.ArgumentParser(description="Ghost Coder - MQTT-based coding assistant")
@@ -564,7 +588,19 @@ def main():
 
     # Configure logging based on --logging flag
     if args.logging:
+        logger.configure(
+            handlers=[
+                {
+                    "sink": "ghost_coder.log",
+                    "format": "[{time:YYYY-MM-DD HH:mm:ss}] {level} {name}:{function}:{line} - {message}",
+                    "rotation": "10 MB",
+                    "retention": "7 days",
+                    "level": "DEBUG"
+                }
+            ]
+        )
         logger.enable("ghost_coder")
+        logger.info("Logging enabled - writing to ghost_coder.log")
     else:
         logger.disable("ghost_coder")
 
@@ -649,9 +685,9 @@ def main():
     ui.run(
         title=f"Ghost Coder {APP_VERSION}",
         native=True,
-        window_size=(700, 900),
+        window_size=(1600, 900),
         reload=False,
     )
 
-if __name__ == "__main__":
+if __name__ in "__main__":
     main()

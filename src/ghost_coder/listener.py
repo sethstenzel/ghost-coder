@@ -100,6 +100,9 @@ class Listener:
         self._pressed_buttons = set()
         self._pressed_gamepad = set()
 
+        # Track inputs that were just registered (to suppress immediate trigger)
+        self._just_registered_input: Optional[tuple] = None  # (source, value)
+
     def _on_mqtt_connect(self, client, userdata, flags, rc):
         """Callback when MQTT client connects."""
         if rc == 0:
@@ -403,21 +406,39 @@ class Listener:
                 msg_info = f" with message '{self._recording_message}'" if self._recording_message else ""
                 suppress_info = " (suppressed)" if self._recording_suppress else ""
                 logger.info(f"Registered hotkey {self._recording_slot}: Keyboard '{key_str}'{msg_info}{suppress_info}")
+
+                # Send confirmation to UI
+                confirmation_data = {
+                    "event": "hotkey_registered",
+                    "slot": self._recording_slot,
+                    "source": InputSource.KEYBOARD.value,
+                    "value": key_str
+                }
+                self.emit("LISTENER", confirmation_data)
+
+                # Mark this input as just registered to prevent immediate trigger
+                self._just_registered_input = (InputSource.KEYBOARD, key_str)
+
                 self._recording_slot = None
                 self._recording_source = None
                 self._recording_message = None
                 self._recording_suppress = False
-                return
+                return  # Return early to prevent immediate trigger
 
             # Track pressed state
             self._pressed_keys.add(key_str)
 
-            # Check if this triggers any hotkey
-            for slot, hotkey in self._hotkeys.items():
-                if hotkey and hotkey.source == InputSource.KEYBOARD and hotkey.value == key_str:
-                    self._trigger_hotkey(slot, hotkey)
-                    if hotkey.suppress:
-                        should_suppress = True
+            # Check if this triggers any hotkey (skip if we're in recording mode for any slot)
+            if not self._recording_slot:
+                for slot, hotkey in self._hotkeys.items():
+                    if hotkey and hotkey.source == InputSource.KEYBOARD and hotkey.value == key_str:
+                        # Skip if this was just registered
+                        if self._just_registered_input == (InputSource.KEYBOARD, key_str):
+                            logger.debug(f"Skipping trigger for just-registered keyboard input: {key_str}")
+                            continue
+                        self._trigger_hotkey(slot, hotkey)
+                        if hotkey.suppress:
+                            should_suppress = True
 
         if should_suppress:
             return False
@@ -428,6 +449,11 @@ class Listener:
 
         with self._lock:
             self._pressed_keys.discard(key_str)
+
+            # Clear just-registered flag when the registered key is released
+            if self._just_registered_input == (InputSource.KEYBOARD, key_str):
+                self._just_registered_input = None
+                logger.debug(f"Cleared just-registered flag for keyboard input: {key_str}")
 
     def _format_key(self, key) -> str:
         """Format a pynput key object to a string."""
@@ -447,6 +473,11 @@ class Listener:
         if not pressed:
             with self._lock:
                 self._pressed_buttons.discard(button_str)
+
+                # Clear just-registered flag when the registered button is released
+                if self._just_registered_input == (InputSource.MOUSE, button_str):
+                    self._just_registered_input = None
+                    logger.debug(f"Cleared just-registered flag for mouse input: {button_str}")
             return
 
         should_suppress = False
@@ -465,21 +496,39 @@ class Listener:
                 msg_info = f" with message '{self._recording_message}'" if self._recording_message else ""
                 suppress_info = " (suppressed)" if self._recording_suppress else ""
                 logger.info(f"Registered hotkey {self._recording_slot}: Mouse '{button_str}'{msg_info}{suppress_info}")
+
+                # Send confirmation to UI
+                confirmation_data = {
+                    "event": "hotkey_registered",
+                    "slot": self._recording_slot,
+                    "source": InputSource.MOUSE.value,
+                    "value": button_str
+                }
+                self.emit("LISTENER", confirmation_data)
+
+                # Mark this input as just registered to prevent immediate trigger
+                self._just_registered_input = (InputSource.MOUSE, button_str)
+
                 self._recording_slot = None
                 self._recording_source = None
                 self._recording_message = None
                 self._recording_suppress = False
-                return
+                return  # Return early to prevent immediate trigger
 
             # Track pressed state
             self._pressed_buttons.add(button_str)
 
-            # Check if this triggers any hotkey
-            for slot, hotkey in self._hotkeys.items():
-                if hotkey and hotkey.source == InputSource.MOUSE and hotkey.value == button_str:
-                    self._trigger_hotkey(slot, hotkey)
-                    if hotkey.suppress:
-                        should_suppress = True
+            # Check if this triggers any hotkey (skip if we're in recording mode for any slot)
+            if not self._recording_slot:
+                for slot, hotkey in self._hotkeys.items():
+                    if hotkey and hotkey.source == InputSource.MOUSE and hotkey.value == button_str:
+                        # Skip if this was just registered
+                        if self._just_registered_input == (InputSource.MOUSE, button_str):
+                            logger.debug(f"Skipping trigger for just-registered mouse input: {button_str}")
+                            continue
+                        self._trigger_hotkey(slot, hotkey)
+                        if hotkey.suppress:
+                            should_suppress = True
 
         if should_suppress:
             return False
@@ -500,37 +549,41 @@ class Listener:
                     suppress=self._recording_suppress
                 )
                 self._hotkeys[self._recording_slot] = hotkey
-    def _on_mouse_scroll(self, _x, _y, dx, dy):
-        """Handle mouse scroll events."""
-        scroll_event = f"scroll_{'up' if dy > 0 else 'down'}" if dy != 0 else f"scroll_{'right' if dx > 0 else 'left'}"
-        should_suppress = False
-
-        with self._lock:
-            # Check if we're recording
-            if self._recording_slot and self._recording_source == InputSource.MOUSE:
-                hotkey = HotkeyEvent(
-                    slot=self._recording_slot,
-                    source=InputSource.MOUSE,
-                    value=scroll_event,
-                    message=self._recording_message,
-                    suppress=self._recording_suppress
-                )
-                self._hotkeys[self._recording_slot] = hotkey
                 msg_info = f" with message '{self._recording_message}'" if self._recording_message else ""
                 suppress_info = " (suppressed)" if self._recording_suppress else ""
                 logger.info(f"Registered hotkey {self._recording_slot}: Mouse '{scroll_event}'{msg_info}{suppress_info}")
+
+                # Send confirmation to UI
+                confirmation_data = {
+                    "event": "hotkey_registered",
+                    "slot": self._recording_slot,
+                    "source": InputSource.MOUSE.value,
+                    "value": scroll_event
+                }
+                self.emit("LISTENER", confirmation_data)
+
+                # Mark this input as just registered to prevent immediate trigger
+                self._just_registered_input = (InputSource.MOUSE, scroll_event)
+
                 self._recording_slot = None
                 self._recording_source = None
                 self._recording_message = None
                 self._recording_suppress = False
                 return
 
-            # Check if this triggers any hotkey
-            for slot, hotkey in self._hotkeys.items():
-                if hotkey and hotkey.source == InputSource.MOUSE and hotkey.value == scroll_event:
-                    self._trigger_hotkey(slot, hotkey)
-                    if hotkey.suppress:
-                        should_suppress = True
+            # Check if this triggers any hotkey (skip if we're in recording mode for any slot)
+            if not self._recording_slot:
+                for slot, hotkey in self._hotkeys.items():
+                    if hotkey and hotkey.source == InputSource.MOUSE and hotkey.value == scroll_event:
+                        # Skip if this was just registered
+                        if self._just_registered_input == (InputSource.MOUSE, scroll_event):
+                            logger.debug(f"Skipping trigger for just-registered mouse scroll: {scroll_event}")
+                            # Clear the flag immediately for scroll events (they don't have a release)
+                            self._just_registered_input = None
+                            continue
+                        self._trigger_hotkey(slot, hotkey)
+                        if hotkey.suppress:
+                            should_suppress = True
 
         if should_suppress:
             return False
@@ -558,6 +611,11 @@ class Listener:
                         # Handle release
                         with self._lock:
                             self._pressed_gamepad.discard(event.code)
+
+                            # Clear just-registered flag when the registered button is released
+                            if self._just_registered_input == (InputSource.GAMEPAD, event.code):
+                                self._just_registered_input = None
+                                logger.debug(f"Cleared just-registered flag for gamepad input: {event.code}")
                         continue
 
                     gamepad_code = event.code
@@ -582,6 +640,20 @@ class Listener:
                             msg_info = f" with message '{self._recording_message}'" if self._recording_message else ""
                             suppress_info = " (suppressed)" if self._recording_suppress else ""
                             logger.info(f"Registered hotkey {self._recording_slot}: Gamepad '{gamepad_device_name}' button '{gamepad_code}'{msg_info}{suppress_info}")
+
+                            # Send confirmation to UI
+                            confirmation_data = {
+                                "event": "hotkey_registered",
+                                "slot": self._recording_slot,
+                                "source": InputSource.GAMEPAD.value,
+                                "value": gamepad_code,
+                                "gamepad_name": gamepad_device_name
+                            }
+                            self.emit("LISTENER", confirmation_data)
+
+                            # Mark this input as just registered to prevent immediate trigger
+                            self._just_registered_input = (InputSource.GAMEPAD, gamepad_code)
+
                             self._recording_slot = None
                             self._recording_source = None
                             self._recording_gamepad_name = None
@@ -593,13 +665,18 @@ class Listener:
                         if gamepad_code not in self._pressed_gamepad:
                             self._pressed_gamepad.add(gamepad_code)
 
-                            # Check if this triggers any hotkey
-                            for slot, hotkey in self._hotkeys.items():
-                                if (hotkey and
-                                    hotkey.source == InputSource.GAMEPAD and
-                                    hotkey.value == gamepad_code and
-                                    (hotkey.gamepad_name is None or hotkey.gamepad_name == gamepad_device_name)):
-                                    self._trigger_hotkey(slot, hotkey)
+                            # Check if this triggers any hotkey (skip if we're in recording mode for any slot)
+                            if not self._recording_slot:
+                                for slot, hotkey in self._hotkeys.items():
+                                    if (hotkey and
+                                        hotkey.source == InputSource.GAMEPAD and
+                                        hotkey.value == gamepad_code and
+                                        (hotkey.gamepad_name is None or hotkey.gamepad_name == gamepad_device_name)):
+                                        # Skip if this was just registered
+                                        if self._just_registered_input == (InputSource.GAMEPAD, gamepad_code):
+                                            logger.debug(f"Skipping trigger for just-registered gamepad input: {gamepad_code}")
+                                            continue
+                                        self._trigger_hotkey(slot, hotkey)
 
             except Exception as e:
                 # No gamepad connected or other error
@@ -635,11 +712,15 @@ def listener_process(port: int, enable_logging: bool = False):
         logger.configure(
             handlers=[
                 {
-                    "sink": lambda msg: print(msg, end=""),
-                    "format": "[{time:YYYY-MM-DD HH:mm:ss}] {level} {name}: {message}",
+                    "sink": "ghost_coder.log",
+                    "format": "[{time:YYYY-MM-DD HH:mm:ss}] {level} {name}:{function}:{line} - {message}",
+                    "rotation": "10 MB",
+                    "retention": "7 days",
+                    "level": "DEBUG"
                 }
             ]
         )
+        logger.enable("ghost_coder")
     else:
         logger.disable("ghost_coder")
     
