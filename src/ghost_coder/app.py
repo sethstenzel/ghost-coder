@@ -21,6 +21,7 @@ UI_ELEMENTS = {
     'source_file_path_field': None,
     'select_source_file_button': None,
     'open_folder_button': None,
+    'open_in_editor_button': None,
     'play_button': None,
     'stop_button': None,
     'advance_to_next_newline_button': None,
@@ -238,9 +239,11 @@ async def open_native_file_dialog():
         ui.notify(f'File chosen: {path}')
         UI_ELEMENTS['play_button'].enable()
 
-        # Enable the open folder button
+        # Enable the open folder button and open in editor button
         if UI_ELEMENTS['open_folder_button']:
             UI_ELEMENTS['open_folder_button'].enable()
+        if UI_ELEMENTS['open_in_editor_button']:
+            UI_ELEMENTS['open_in_editor_button'].enable()
 
         try:
             # Read and display file contents in UI
@@ -284,6 +287,32 @@ def open_source_folder():
     except Exception as e:
         ui.notify(f'Error opening folder: {e}', type='negative')
         logger.error(f'Error opening folder for {source_path}: {e}')
+
+def open_in_editor():
+    """Open the source file in VS Code if available, otherwise in Notepad."""
+    source_path = APP_STATE.get('source_file_path')
+
+    if not source_path:
+        ui.notify("No source file loaded", type='warning')
+        logger.warning("Attempted to open file in editor but no source file is loaded")
+        return
+
+    try:
+        # Try to open with VS Code first
+        try:
+            # Try 'code' command (VS Code CLI)
+            subprocess.Popen(['code', source_path])
+            logger.info(f"Opened file in VS Code: {source_path}")
+            ui.notify("Opened in VS Code")
+        except (FileNotFoundError, OSError):
+            # VS Code not found, try notepad as fallback
+            logger.info("VS Code not found, falling back to Notepad")
+            subprocess.Popen(['notepad.exe', source_path])
+            logger.info(f"Opened file in Notepad: {source_path}")
+            ui.notify("Opened in Notepad (VS Code not found)")
+    except Exception as e:
+        ui.notify(f'Error opening file in editor: {e}', type='negative')
+        logger.error(f'Error opening file {source_path} in editor: {e}')
 
 # UI callback functions
 def update_slider_label(e):
@@ -567,6 +596,12 @@ def build_ui():
                     on_click=open_source_folder
                 )
                 UI_ELEMENTS['open_folder_button'].disable()
+                UI_ELEMENTS['open_in_editor_button'] = ui.button(
+                    'Open in Editor',
+                    icon='edit',
+                    on_click=open_in_editor
+                )
+                UI_ELEMENTS['open_in_editor_button'].disable()
 
             ui.separator().style("")
 
