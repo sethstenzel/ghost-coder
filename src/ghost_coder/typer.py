@@ -340,6 +340,7 @@ class Typer:
         while not token_completed and self.play:
             if isinstance(token, MultiKeys):
                 if self.check_window_focused(pause_if_not=True):
+                    # Press all keys in order
                     for key in token.keys:
                         self.focus_window()
                         if hasattr(Key, key):
@@ -347,7 +348,8 @@ class Typer:
                         else:
                             kb.press(key)
                     time.sleep(typing_speed/1000/2)
-                    for key in token.keys:
+                    # Release all keys in reverse order (for proper modifier key handling)
+                    for key in reversed(token.keys):
                         self.focus_window()
                         if hasattr(Key, key):
                             kb.release(getattr(Key, key))

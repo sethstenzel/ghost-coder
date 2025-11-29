@@ -1,6 +1,5 @@
 import json
 import multiprocessing as mp
-import multiprocessing
 import argparse
 import time
 import os
@@ -238,6 +237,13 @@ async def open_native_file_dialog():
         UI_ELEMENTS['file_input'].value = path
         ui.notify(f'File chosen: {path}')
         UI_ELEMENTS['play_button'].enable()
+
+        # Stop any active playback before loading new file
+        if APP_STATE['play_status'] in ['playing', 'paused']:
+            logger.info("Stopping playback due to new file load")
+            APP_STATE['play_status'] = 'stopped'
+            ui.notify("Stopping playback...")
+            state_changed()
 
         # Enable the open folder button and open in editor button
         if UI_ELEMENTS['open_folder_button']:
@@ -661,7 +667,8 @@ def main():
     parser = argparse.ArgumentParser(description="Ghost Coder - MQTT-based coding assistant")
     parser.add_argument("--port", type=int, help="Specify the MQTT broker port (overrides random port selection)")
     parser.add_argument("--logging", action="store_true", help="Enable logging output")
-    args = parser.parse_args()
+    # args = parser.parse_args()
+    args, _unknown = parser.parse_known_args()
 
     # Configure logging based on --logging flag
     if args.logging:
@@ -694,9 +701,7 @@ def main():
         available_port = get_random_available_port()
         logger.info(f"Random port: {available_port}")
 
-    # Start child processes
-    mp.set_start_method("spawn", force=True)
-    
+    # Start child processes    
     child_processes = {}
     
     # Start broker process
@@ -772,5 +777,7 @@ def main():
         port=48888
     )
 
-if __name__ in "__main__":
+if __name__ == "__main__":
+    mp.freeze_support()
+    mp.set_start_method("spawn", force=True)
     main()

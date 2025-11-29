@@ -155,13 +155,52 @@ class TextData():
             return SingleKey(key="enter")
 
         # Check for general key patterns (must come last to avoid conflicts)
-        key_match = re.search(r"<<([a-zA-Z0-9+]+)>>", string_token)
+        # Updated to include special characters like backtick, tilde, brackets, etc.
+        key_match = re.search(r"<<([^<>]+)>>", string_token)
         if key_match:
             keys = tuple(key_match.group(1).split('+'))
-            if len(keys) == 1:
-                # Normalize key name to lowercase for pynput compatibility
-                return SingleKey(key=keys[0].lower())
-            # Normalize all keys in multi-key combinations to lowercase
-            return MultiKeys(keys=tuple(k.lower() for k in keys))
+
+            # Map common key names to pynput Key names
+            key_mapping = {
+                'ctrl': 'ctrl',
+                'control': 'ctrl',
+                'alt': 'alt',
+                'shift': 'shift',
+                'win': 'cmd',  # Windows key maps to cmd in pynput
+                'cmd': 'cmd',
+                'super': 'cmd',
+                'esc': 'esc',
+                'escape': 'esc',
+                'enter': 'enter',
+                'return': 'enter',
+                'tab': 'tab',
+                'space': 'space',
+                'backspace': 'backspace',
+                'delete': 'delete',
+                'del': 'delete',
+                'home': 'home',
+                'end': 'end',
+                'pageup': 'page_up',
+                'pagedown': 'page_down',
+                'up': 'up',
+                'down': 'down',
+                'left': 'left',
+                'right': 'right',
+                'f1': 'f1', 'f2': 'f2', 'f3': 'f3', 'f4': 'f4',
+                'f5': 'f5', 'f6': 'f6', 'f7': 'f7', 'f8': 'f8',
+                'f9': 'f9', 'f10': 'f10', 'f11': 'f11', 'f12': 'f12',
+            }
+
+            # Normalize and map keys
+            normalized_keys = []
+            for key in keys:
+                key_lower = key.lower()
+                # Use mapping if available, otherwise use the key as-is (for regular characters)
+                mapped_key = key_mapping.get(key_lower, key_lower)
+                normalized_keys.append(mapped_key)
+
+            if len(normalized_keys) == 1:
+                return SingleKey(key=normalized_keys[0])
+            return MultiKeys(keys=tuple(normalized_keys))
 
         raise ValueError("Invalid format")
