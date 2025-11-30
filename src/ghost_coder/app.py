@@ -4,6 +4,7 @@ import argparse
 import time
 import os
 import subprocess
+from pathlib import Path
 from loguru import logger
 from nicegui import ui, app
 from queue import Queue
@@ -15,6 +16,9 @@ from ghost_coder.typer import typer_process
 
 
 APP_VERSION = "0.1.0"
+
+# Path to hotkeys configuration file
+HOTKEYS_FILE = Path(__file__).parent / "hotkeys.json"
 
 UI_ELEMENTS = {
     'source_file_path_field': None,
@@ -99,6 +103,73 @@ def on_mqtt_message(client, userdata, message):
     mqtt_queue.put((message.topic, message.payload.decode()))
     logger.debug(f"UI received message - Topic: {message.topic}, Payload: {message.payload.decode()}")
 
+def save_hotkeys():
+    """Save current hotkeys to hotkeys.json file."""
+    try:
+        # Filter out None values before saving
+        hotkeys_to_save = {
+            str(slot): hotkey_data
+            for slot, hotkey_data in APP_STATE['hotkeys'].items()
+            if hotkey_data is not None
+        }
+
+        with open(HOTKEYS_FILE, 'w') as f:
+            json.dump(hotkeys_to_save, f, indent=2)
+
+        logger.info(f"Hotkeys saved to {HOTKEYS_FILE}")
+    except Exception as e:
+        logger.error(f"Error saving hotkeys: {e}")
+
+def load_hotkeys():
+    """Load hotkeys from hotkeys.json file."""
+    try:
+        if HOTKEYS_FILE.exists():
+            with open(HOTKEYS_FILE, 'r') as f:
+                saved_hotkeys = json.load(f)
+
+            # Convert string keys back to integers and update APP_STATE
+            for slot_str, hotkey_data in saved_hotkeys.items():
+                slot = int(slot_str)
+                if slot in APP_STATE['hotkeys']:
+                    APP_STATE['hotkeys'][slot] = hotkey_data
+
+            logger.info(f"Hotkeys loaded from {HOTKEYS_FILE}: {saved_hotkeys}")
+            return True
+        else:
+            logger.info(f"No hotkeys file found at {HOTKEYS_FILE}")
+            return False
+    except Exception as e:
+        logger.error(f"Error loading hotkeys: {e}")
+        return False
+
+def send_hotkeys_to_listener():
+    """Send loaded hotkeys to the listener process to re-register them."""
+    if not mqtt_client or not mqtt_client.is_connected():
+        logger.warning("Cannot send hotkeys to listener - MQTT not connected")
+        return
+
+    hotkeys_to_restore = 0
+
+    for slot, hotkey_data in APP_STATE['hotkeys'].items():
+        if hotkey_data:
+            # Send a restore request to the listener
+            # The listener will validate device availability and respond with success/error
+            restore_msg = json.dumps({
+                "event": "hotkey_registered",
+                "slot": slot,
+                "source": hotkey_data.get('source'),
+                "value": hotkey_data.get('value'),
+                "gamepad_name": hotkey_data.get('gamepad_name'),
+                "restore": True  # Flag to indicate this is a restore operation
+            })
+            mqtt_client.publish("LISTENER", restore_msg, qos=1)
+            hotkeys_to_restore += 1
+            logger.info(f"Requesting restoration of hotkey - Slot {slot}: {hotkey_data}")
+
+    if hotkeys_to_restore > 0:
+        logger.info(f"Requested restoration of {hotkeys_to_restore} saved hotkey(s)")
+        ui.notify(f"Restoring {hotkeys_to_restore} saved hotkey(s)...")
+
 def check_mqtt_messages():
     """Process MQTT messages from the queue."""
     while not mqtt_queue.empty():
@@ -141,6 +212,26 @@ def check_mqtt_messages():
                 slot = data.get("slot")
                 logger.info(f"Hotkey {slot} triggered")
                 handle_hotkey_trigger(slot)
+            elif event == "hotkey_restoration_success":
+                # Handle successful hotkey restoration
+                slot = data.get("slot")
+                source = data.get("source")
+                value = data.get("value")
+                logger.info(f"Hotkey restored successfully for slot {slot}: {source} - {value}")
+                # UI already has the hotkey in APP_STATE from loading, just update labels
+                update_hotkey_labels()
+            elif event == "hotkey_restoration_error":
+                # Handle hotkey restoration error (device not available)
+                slot = data.get("slot")
+                source = data.get("source")
+                error = data.get("error")
+                logger.warning(f"Hotkey restoration failed for slot {slot}: {error}")
+                # Clear the failed hotkey from APP_STATE
+                if slot in APP_STATE['hotkeys']:
+                    APP_STATE['hotkeys'][slot] = None
+                    update_hotkey_labels()
+                    save_hotkeys()  # Save updated state without the failed hotkey
+                ui.notify(f"Hotkey {slot} not restored: {error}", type='warning')
             elif event == "hotkey_registered":
                 # Handle hotkey registration confirmation
                 slot = data.get("slot")
@@ -149,6 +240,43 @@ def check_mqtt_messages():
                 gamepad_name = data.get("gamepad_name")
 
                 if slot and source and value:
+                    # Check if this hotkey is already assigned to another slot
+                    for existing_slot, existing_hotkey in APP_STATE['hotkeys'].items():
+                        if existing_slot != slot and existing_hotkey:
+                            # Check if it's the same hotkey (same source, value, and gamepad if applicable)
+                            if (existing_hotkey.get('source') == source and
+                                existing_hotkey.get('value') == value):
+                                # For gamepad hotkeys, also check gamepad_name
+                                if source == 'gamepad':
+                                    existing_gamepad = existing_hotkey.get('gamepad_name')
+                                    if existing_gamepad == gamepad_name:
+                                        # Same gamepad hotkey, clear the old assignment
+                                        logger.info(f"Hotkey already assigned to slot {existing_slot}, clearing old assignment")
+                                        APP_STATE['hotkeys'][existing_slot] = None
+                                        # Send unregister command to listener for the old slot
+                                        if mqtt_client and mqtt_client.is_connected():
+                                            unregister_msg = json.dumps({
+                                                "cmd": "unregister",
+                                                "slot": existing_slot
+                                            })
+                                            mqtt_client.publish("LISTENER", unregister_msg, qos=1)
+                                        ui.notify(f"Hotkey moved from slot {existing_slot} to slot {slot}", type='info')
+                                        break
+                                else:
+                                    # Non-gamepad hotkey (keyboard/mouse), clear the old assignment
+                                    logger.info(f"Hotkey already assigned to slot {existing_slot}, clearing old assignment")
+                                    APP_STATE['hotkeys'][existing_slot] = None
+                                    # Send unregister command to listener for the old slot
+                                    if mqtt_client and mqtt_client.is_connected():
+                                        unregister_msg = json.dumps({
+                                            "cmd": "unregister",
+                                            "slot": existing_slot
+                                        })
+                                        mqtt_client.publish("LISTENER", unregister_msg, qos=1)
+                                    ui.notify(f"Hotkey moved from slot {existing_slot} to slot {slot}", type='info')
+                                    break
+
+                    # Assign the new hotkey
                     APP_STATE['hotkeys'][slot] = {
                         'source': source,
                         'value': value
@@ -156,6 +284,7 @@ def check_mqtt_messages():
                     if gamepad_name:
                         APP_STATE['hotkeys'][slot]['gamepad_name'] = gamepad_name
                     update_hotkey_labels()
+                    save_hotkeys()  # Auto-save when hotkey is registered
                     logger.info(f"Hotkey registered for slot {slot}: {source} - {value}")
                     ui.notify(f"Hotkey registered: {source.capitalize()} - {value}")
             elif event == "hotkey_registration_error":
@@ -523,6 +652,7 @@ def clear_hotkey(slot: int, dialog):
         # Update local state
         APP_STATE['hotkeys'][slot] = None
         update_hotkey_labels()
+        save_hotkeys()  # Auto-save when hotkey is cleared
 
         ui.notify(f"Hotkey cleared")
         dialog.close()
@@ -779,11 +909,19 @@ def main():
     
     app.on_shutdown(on_shutdown)
     
+    # Load saved hotkeys before building UI
+    load_hotkeys()
+
     # Build UI
     build_ui()
 
     # Setup MQTT after UI is ready
-    ui.timer(0.5, lambda: setup_mqtt_client(broker_host, available_port), once=True)
+    def on_mqtt_ready():
+        setup_mqtt_client(broker_host, available_port)
+        # Wait a bit for MQTT to connect, then send hotkeys and update UI
+        ui.timer(1.0, lambda: (send_hotkeys_to_listener(), update_hotkey_labels()), once=True)
+
+    ui.timer(0.5, on_mqtt_ready, once=True)
     
     # Start process monitor in background
     def monitor_processes():

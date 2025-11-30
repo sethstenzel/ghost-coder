@@ -119,16 +119,24 @@ class Listener:
         try:
             payload = message.payload.decode()
             logger.debug(f"Listener received message: {payload}")
-            
+
             # Try to parse as JSON
             try:
                 cmd_data = json.loads(payload)
-                
-                # Ignore messages that are events (not commands)
+
+                # Handle event messages - check for restore flag
                 if "event" in cmd_data:
-                    logger.debug(f"Ignoring event message: {cmd_data.get('event')}")
+                    event = cmd_data.get('event')
+
+                    # Handle hotkey restoration
+                    if event == "hotkey_registered" and cmd_data.get("restore"):
+                        self._restore_hotkey(cmd_data)
+                        return
+
+                    # Ignore other event messages
+                    logger.debug(f"Ignoring event message: {event}")
                     return
-                
+
                 # Handle cmd-based format
                 cmd = cmd_data.get("cmd")
                 
@@ -376,6 +384,98 @@ class Listener:
             self._hotkeys[slot] = None
 
         logger.info(f"Cleared hotkey slot {slot}")
+
+    def _restore_hotkey(self, data: Dict[str, Any]):
+        """Restore a hotkey from saved configuration."""
+        try:
+            slot = data.get("slot")
+            source = data.get("source")
+            value = data.get("value")
+            gamepad_name = data.get("gamepad_name")
+
+            if not slot or not source or not value:
+                logger.error(f"Invalid restore data: missing required fields")
+                return
+
+            # Convert source string to enum
+            try:
+                source_enum = InputSource(source)
+            except ValueError:
+                logger.error(f"Invalid input source: {source}")
+                return
+
+            # Validate slot
+            if slot < 1 or slot > 8:
+                logger.error(f"Invalid slot number: {slot}")
+                return
+
+            # For gamepad hotkeys, check if the gamepad is still available
+            if source_enum == InputSource.GAMEPAD:
+                # Refresh gamepad list
+                refresh_gamepad_devices()
+                gamepads = self.get_gamepads()
+                gamepad_names = [gp['name'] for gp in gamepads]
+
+                # If specific gamepad was saved, check if it's available
+                if gamepad_name and gamepad_name not in gamepad_names:
+                    logger.warning(f"Gamepad '{gamepad_name}' not found. Cannot restore hotkey for slot {slot}")
+                    # Send error back to UI
+                    error_data = {
+                        "event": "hotkey_restoration_error",
+                        "slot": slot,
+                        "source": source,
+                        "error": f"Gamepad '{gamepad_name}' not connected"
+                    }
+                    self.emit("LISTENER", error_data)
+                    return
+
+                # If no specific gamepad, check if any gamepad is available
+                if not gamepad_name and not gamepads:
+                    logger.warning(f"No gamepad available. Cannot restore hotkey for slot {slot}")
+                    error_data = {
+                        "event": "hotkey_restoration_error",
+                        "slot": slot,
+                        "source": source,
+                        "error": "No gamepad connected"
+                    }
+                    self.emit("LISTENER", error_data)
+                    return
+
+            # Create and store the hotkey
+            with self._lock:
+                hotkey = HotkeyEvent(
+                    slot=slot,
+                    source=source_enum,
+                    value=value,
+                    gamepad_name=gamepad_name,
+                    message=None,
+                    suppress=False
+                )
+                self._hotkeys[slot] = hotkey
+
+            logger.info(f"Restored hotkey for slot {slot}: {source} - {value}")
+
+            # Send confirmation back to UI
+            confirmation_data = {
+                "event": "hotkey_restoration_success",
+                "slot": slot,
+                "source": source,
+                "value": value
+            }
+            if gamepad_name:
+                confirmation_data["gamepad_name"] = gamepad_name
+
+            self.emit("LISTENER", confirmation_data)
+
+        except Exception as e:
+            logger.error(f"Error restoring hotkey: {e}")
+            error_data = {
+                "event": "hotkey_restoration_error",
+                "slot": data.get("slot"),
+                "source": data.get("source"),
+                "error": str(e)
+            }
+            self.emit("LISTENER", error_data)
 
     # ==================== Keyboard Handlers ====================
 
