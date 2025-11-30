@@ -5,13 +5,13 @@ from amqtt.broker import Broker
 import paho.mqtt.client as Client
 
 
-def broker_process(available_port, enable_logging=True):
+def broker_process(broker_host, available_port, enable_logging=True):
 
     broker_config = {
         "listeners": {
             "default": {
                 "type": "tcp",
-                "bind": f"127.0.0.1:{available_port}",
+                "bind": f"{broker_host}:{available_port}",
             }
         },
     }
@@ -72,12 +72,12 @@ def broker_process(available_port, enable_logging=True):
     async def start_broker():
         nonlocal mqtt_client
         await broker.start()
-        logger.info(f"Broker ready and accepting connections on 127.0.0.1:{available_port}")
+        logger.info(f"Broker ready and accepting connections on {broker_host}:{available_port}")
         
         # Create a client to subscribe to the BROKER topic
         mqtt_client = Client.Client(Client.CallbackAPIVersion.VERSION1, "broker_listener")
         mqtt_client.on_message = on_message
-        mqtt_client.connect("127.0.0.1", available_port)
+        mqtt_client.connect(broker_host, available_port)
         mqtt_client.subscribe([
             ("BROKER", 0),
             ("APP", 0),
@@ -97,6 +97,3 @@ def broker_process(available_port, enable_logging=True):
         loop.run_until_complete(broker.shutdown())
         loop.close()
         logger.info("Broker Stopped")
-
-if __name__ == "__main__":
-    broker_process(55555)

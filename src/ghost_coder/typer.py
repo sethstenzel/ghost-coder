@@ -30,7 +30,7 @@ class Typer:
     - State synchronization via STATE topic
     """
 
-    def __init__(self, mqtt_port: int):
+    def __init__(self, mqtt_host, mqtt_port: int):
         """
         Initialize the Typer.
 
@@ -72,6 +72,7 @@ class Typer:
 
         # MQTT setup
         self._mqtt_port = mqtt_port
+        self._mqtt_host = mqtt_host
         self._mqtt_client = Client.Client(Client.CallbackAPIVersion.VERSION1, "typer_client")
         self._mqtt_client.on_connect = self._on_mqtt_connect
         self._mqtt_client.on_message = self._on_mqtt_message
@@ -578,7 +579,7 @@ class Typer:
 
         # Connect to MQTT broker
         try:
-            self._mqtt_client.connect("127.0.0.1", self._mqtt_port, keepalive=60)
+            self._mqtt_client.connect(self._mqtt_host, self._mqtt_port, keepalive=60)
             self._mqtt_client.loop_start()
             logger.info(f"Typer connecting to MQTT broker on port {self._mqtt_port}")
         except Exception as e:
@@ -606,7 +607,7 @@ class Typer:
         return self._running
 
 
-def typer_process(port: int, enable_logging: bool = True):
+def typer_process(host:str, port: int, enable_logging: bool = True):
     """Run the typer as a separate process."""
     if enable_logging:
         logger.configure(
@@ -630,7 +631,7 @@ def typer_process(port: int, enable_logging: bool = True):
         logger.disable("ghost_coder")
 
     logger.info("Starting Typer process")
-    typer = Typer(mqtt_port=port)
+    typer = Typer(mqtt_host = host, mqtt_port=port)
     typer.start()
 
     try:
@@ -643,6 +644,3 @@ def typer_process(port: int, enable_logging: bool = True):
         typer.stop()
         logger.info("Typer stopped")
 
-
-if __name__ == "__main__":
-    typer_process(55555)

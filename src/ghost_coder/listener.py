@@ -55,7 +55,7 @@ class Listener:
     - Configurable input source for hotkey registration
     """
 
-    def __init__(self, mqtt_port: int, gamepad_name: Optional[str] = None):
+    def __init__(self, mqtt_host:str, mqtt_port: int, gamepad_name: Optional[str] = None):
         """
         Initialize the Listener.
 
@@ -77,6 +77,7 @@ class Listener:
 
         # MQTT setup
         self._mqtt_port = mqtt_port
+        self._mqtt_host = mqtt_host
         self._mqtt_client = Client.Client(Client.CallbackAPIVersion.VERSION1, "listener_client")
         self._mqtt_client.on_connect = self._on_mqtt_connect
         self._mqtt_client.on_message = self._on_mqtt_message
@@ -170,7 +171,7 @@ class Listener:
 
         # Connect to MQTT broker
         try:
-            self._mqtt_client.connect("127.0.0.1", self._mqtt_port, keepalive=60)
+            self._mqtt_client.connect(self._mqtt_host, self._mqtt_port, keepalive=60)
             self._mqtt_client.loop_start()
             logger.info(f"Listener connecting to MQTT broker on port {self._mqtt_port}")
         except Exception as e:
@@ -706,7 +707,7 @@ class Listener:
         self.emit("LISTENER", event_data)
 
 
-def listener_process(port: int, enable_logging: bool = False):
+def listener_process(host: str, port: int, enable_logging: bool = False):
     """Run the listener as a separate process."""
     if enable_logging:
         logger.configure(
@@ -730,7 +731,7 @@ def listener_process(port: int, enable_logging: bool = False):
         logger.disable("ghost_coder")
     
     logger.info("Starting Listener process")
-    listener = Listener(mqtt_port=port)
+    listener = Listener(mqtt_host=host, mqtt_port=port)
     listener.start()
 
     try:

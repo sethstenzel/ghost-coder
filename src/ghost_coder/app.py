@@ -69,26 +69,26 @@ APP_STATE = {
 mqtt_queue = Queue()
 mqtt_client = None
 
-def setup_mqtt_client(port):
+def setup_mqtt_client(host, port):
     """Initialize and connect the MQTT client."""
     global mqtt_client
 
     mqtt_client = Client.Client(Client.CallbackAPIVersion.VERSION2, "ui_client")
-    mqtt_client.user_data_set({"port": port})
+    mqtt_client.user_data_set({"host": host, "port": port})
     mqtt_client.on_connect = on_mqtt_connect
     mqtt_client.on_message = on_mqtt_message
 
     try:
-        mqtt_client.connect("127.0.0.1", port, keepalive=60)
+        mqtt_client.connect(host, port, keepalive=60)
         mqtt_client.loop_start()
-        logger.info(f"UI MQTT client connecting to 127.0.0.1:{port}")
+        logger.info(f"UI MQTT client connecting to {host}:{port}")
     except Exception as e:
         logger.error(f"Failed to connect UI MQTT client: {e}")
 
 def on_mqtt_connect(client, userdata, flags, rc, properties=None):
     """Callback when MQTT client connects to broker."""
     if rc == 0:
-        logger.info(f"UI connected to MQTT broker on port {userdata['port']}")
+        logger.info(f"UI connected to MQTT broker at {userdata['host']}:{userdata['port']}")
         client.subscribe([("UI", 1), ("APP", 1), ("STATE", 1), ("LISTENER", 1)])
         logger.info("UI subscribed to topics: UI, APP, STATE, LISTENER")
     else:
@@ -158,6 +158,19 @@ def check_mqtt_messages():
                     update_hotkey_labels()
                     logger.info(f"Hotkey registered for slot {slot}: {source} - {value}")
                     ui.notify(f"Hotkey registered: {source.capitalize()} - {value}")
+            elif event == "hotkey_registration_error":
+                # Handle hotkey registration error
+                slot = data.get("slot")
+                source = data.get("source")
+                error = data.get("error")
+                logger.warning(f"Hotkey registration failed for slot {slot}: {error}")
+                ui.notify(f"Hotkey registration failed: {error}", type='negative')
+            elif event == "hotkey_registration_cancelled":
+                # Handle hotkey registration cancellation
+                slot = data.get("slot")
+                source = data.get("source")
+                logger.info(f"Hotkey registration cancelled for slot {slot}")
+                ui.notify("Hotkey registration cancelled", type='info')
             elif "info" not in data:  # Not a help message
                 # Hotkey registration confirmation (no explicit event) - legacy support
                 # Update local state when we receive slot/source/value
@@ -197,34 +210,16 @@ def update_ui_buttons():
         if UI_ELEMENTS['play_button']:
             UI_ELEMENTS['play_button'].props('icon=pause')
             UI_ELEMENTS['play_button'].text = "PAUSE"
-        if UI_ELEMENTS['stop_button']:
-            UI_ELEMENTS['stop_button'].enable()
-        if UI_ELEMENTS['advance_to_next_newline_button']:
-            UI_ELEMENTS['advance_to_next_newline_button'].disable()
-        if UI_ELEMENTS['advance_to_next_token_button']:
-            UI_ELEMENTS['advance_to_next_token_button'].disable()
     elif play_status == "paused":
         # Update button to show RESUME
         if UI_ELEMENTS['play_button']:
             UI_ELEMENTS['play_button'].props('icon=play_arrow')
             UI_ELEMENTS['play_button'].text = "RESUME"
-        if UI_ELEMENTS['stop_button']:
-            UI_ELEMENTS['stop_button'].enable()
-        if UI_ELEMENTS['advance_to_next_newline_button']:
-            UI_ELEMENTS['advance_to_next_newline_button'].enable()
-        if UI_ELEMENTS['advance_to_next_token_button']:
-            UI_ELEMENTS['advance_to_next_token_button'].enable()
     elif play_status == "stopped":
         # Update button to show PLAY
         if UI_ELEMENTS['play_button']:
             UI_ELEMENTS['play_button'].props('icon=play_arrow')
             UI_ELEMENTS['play_button'].text = "PLAY"
-        if UI_ELEMENTS['stop_button']:
-            UI_ELEMENTS['stop_button'].disable()
-        if UI_ELEMENTS['advance_to_next_newline_button']:
-            UI_ELEMENTS['advance_to_next_newline_button'].disable()
-        if UI_ELEMENTS['advance_to_next_token_button']:
-            UI_ELEMENTS['advance_to_next_token_button'].disable()
 
 
 
@@ -236,7 +231,6 @@ async def open_native_file_dialog():
         path = result[0]
         UI_ELEMENTS['file_input'].value = path
         ui.notify(f'File chosen: {path}')
-        UI_ELEMENTS['play_button'].enable()
 
         # Stop any active playback before loading new file
         if APP_STATE['play_status'] in ['playing', 'paused']:
@@ -244,12 +238,6 @@ async def open_native_file_dialog():
             APP_STATE['play_status'] = 'stopped'
             ui.notify("Stopping playback...")
             state_changed()
-
-        # Enable the open folder button and open in editor button
-        if UI_ELEMENTS['open_folder_button']:
-            UI_ELEMENTS['open_folder_button'].enable()
-        if UI_ELEMENTS['open_in_editor_button']:
-            UI_ELEMENTS['open_in_editor_button'].enable()
 
         try:
             # Read and display file contents in UI
@@ -370,6 +358,12 @@ def toggle_varied_coding_speed(e):
     publish_app_state()
 
 def toggle_playback():
+    # Check if a file is loaded
+    if not APP_STATE.get('source_file_path'):
+        ui.notify("No source file is loaded", type='warning')
+        logger.warning("Play clicked but no source file is loaded")
+        return
+
     current_status = APP_STATE.get('play_status')
 
     if current_status == 'playing':
@@ -405,12 +399,32 @@ def toggle_playback():
     state_changed()
 
 def stop_playback():
+    # Check if playback is actually running
+    current_status = APP_STATE.get('play_status')
+    if current_status == 'stopped':
+        ui.notify("No source is playing", type='warning')
+        logger.warning("Stop clicked but nothing is playing")
+        return
+
     logger.info("Stop playback clicked")
     APP_STATE['play_status'] = 'stopped'
     ui.notify("Stopping playback...")
     state_changed()
 
 def on_advance_newline_button():
+    # Check if a file is loaded
+    if not APP_STATE.get('source_file_path'):
+        ui.notify("No source file is loaded", type='warning')
+        logger.warning("Advance newline clicked but no source file is loaded")
+        return
+
+    # Check if playback has started
+    current_status = APP_STATE.get('play_status')
+    if current_status == 'stopped':
+        ui.notify("Playback has not started yet", type='warning')
+        logger.warning("Advance newline clicked but playback has not started")
+        return
+
     logger.info("Advance to newline clicked")
 
     # Send advance_newline command to typer process
@@ -423,6 +437,19 @@ def on_advance_newline_button():
         logger.warning("MQTT client not connected")
 
 def on_advance_token_button():
+    # Check if a file is loaded
+    if not APP_STATE.get('source_file_path'):
+        ui.notify("No source file is loaded", type='warning')
+        logger.warning("Advance token clicked but no source file is loaded")
+        return
+
+    # Check if playback has started
+    current_status = APP_STATE.get('play_status')
+    if current_status == 'stopped':
+        ui.notify("Playback has not started yet", type='warning')
+        logger.warning("Advance token clicked but playback has not started")
+        return
+
     logger.info("Advance to token clicked")
 
     # Send advance_token command to typer process
@@ -437,29 +464,6 @@ def on_advance_token_button():
 
 def show_hotkey_dialog(slot: int, button_name: str):
     """Show a dialog to configure a hotkey for the given slot."""
-    # Track if we're waiting for a hotkey input
-    waiting_for_input = {'active': False}
-
-    def handle_escape():
-        """Handle escape key press during hotkey registration."""
-        if waiting_for_input['active']:
-            # Cancel the hotkey registration
-            if mqtt_client and mqtt_client.is_connected():
-                # Send a dummy unregister to cancel recording state in listener
-                cancel_msg = json.dumps({
-                    "cmd": "unregister",
-                    "slot": slot
-                })
-                mqtt_client.publish("LISTENER", cancel_msg, qos=1)
-                logger.info(f"Cancelled hotkey registration for slot {slot}")
-            ui.notify("Hotkey registration cancelled")
-            waiting_for_input['active'] = False
-
-    def set_hotkey_wrapper(input_type: str):
-        """Wrapper to track when we're waiting for input."""
-        waiting_for_input['active'] = True
-        set_hotkey(slot, input_type, dialog)
-
     with ui.dialog() as dialog, ui.card():
         ui.label(f'Configure Hotkey for {button_name}').classes('text-lg font-bold')
         ui.separator()
@@ -467,23 +471,24 @@ def show_hotkey_dialog(slot: int, button_name: str):
         with ui.column().classes('gap-2'):
             ui.button('Keyboard Hotkey',
                      icon='keyboard',
-                     on_click=lambda: set_hotkey_wrapper('keyboard')).classes('w-full')
+                     on_click=lambda: set_hotkey(slot, 'keyboard', dialog)).classes('w-full')
             ui.button('Mouse Hotkey',
                      icon='mouse',
-                     on_click=lambda: set_hotkey_wrapper('mouse')).classes('w-full')
+                     on_click=lambda: set_hotkey(slot, 'mouse', dialog)).classes('w-full')
             ui.button('Gamepad Hotkey',
                      icon='sports_esports',
-                     on_click=lambda: set_hotkey_wrapper('gamepad')).classes('w-full')
+                     on_click=lambda: set_hotkey(slot, 'gamepad', dialog)).classes('w-full')
             ui.button('Clear Hotkey',
                      icon='clear',
                      on_click=lambda: clear_hotkey(slot, dialog)).classes('w-full')
             ui.separator()
             ui.button('Cancel (or press ESC)',
                      icon='close',
-                     on_click=lambda: [dialog.close(), (handle_escape() if waiting_for_input['active'] else None)]).classes('w-full')
+                     on_click=lambda: dialog.close()).classes('w-full')
 
-        # Add keyboard handler for escape key
-        dialog.on('keydown.esc', lambda: [handle_escape(), dialog.close()])
+        # Add keyboard handler for escape key to close dialog
+        # Note: If in recording mode, the listener will handle ESC and cancel the registration
+        dialog.on('keydown.esc', lambda: dialog.close())
 
     dialog.open()
 
@@ -527,7 +532,7 @@ def clear_hotkey(slot: int, dialog):
         dialog.close()
 
 def update_hotkey_labels():
-    """Update the hotkey label displays."""
+    """Update the hotkey label displays and button borders."""
     hotkey_names = {
         1: "Play | Pause | Resume",
         2: "Stop",
@@ -535,15 +540,33 @@ def update_hotkey_labels():
         4: "Adv. Token"
     }
 
+    # Map slots to button elements
+    button_map = {
+        1: UI_ELEMENTS.get('play_button'),
+        2: UI_ELEMENTS.get('stop_button'),
+        3: UI_ELEMENTS.get('advance_to_next_newline_button'),
+        4: UI_ELEMENTS.get('advance_to_next_token_button')
+    }
+
     for slot, label in UI_ELEMENTS['hotkey_labels'].items():
         if label:
             hotkey_info = APP_STATE['hotkeys'].get(slot)
+            button = button_map.get(slot)
+
             if hotkey_info:
                 source = hotkey_info.get('source', '').capitalize()
                 value = hotkey_info.get('value', '')
                 label.set_text(f"{hotkey_names[slot]}: [{source}: {value}]")
+
+                # Add green border to button if hotkey is set
+                if button:
+                    button.style('border: 2px solid green')
             else:
                 label.set_text(f"{hotkey_names[slot]}: []")
+
+                # Remove green border from button if no hotkey
+                if button:
+                    button.style('border: none')
 
 def play_button_set_hotkey(e):
     show_hotkey_dialog(1, "Play/Pause/Resume")
@@ -601,13 +624,11 @@ def build_ui():
                     icon='folder_open',
                     on_click=open_source_folder
                 )
-                UI_ELEMENTS['open_folder_button'].disable()
                 UI_ELEMENTS['open_in_editor_button'] = ui.button(
                     'Open in Editor',
                     icon='edit',
                     on_click=open_in_editor
                 )
-                UI_ELEMENTS['open_in_editor_button'].disable()
 
             ui.separator().style("")
 
@@ -632,17 +653,13 @@ def build_ui():
 
             with ui.row():
                 UI_ELEMENTS['play_button'] = ui.button("PLAY", icon='play_arrow', on_click=toggle_playback)
-                UI_ELEMENTS['play_button'].disable()
                 UI_ELEMENTS['play_button'].on('contextmenu', play_button_set_hotkey)
 
                 UI_ELEMENTS['stop_button'] = ui.button("STOP", icon='stop', on_click=stop_playback)
-                UI_ELEMENTS['stop_button'].disable()
                 UI_ELEMENTS['stop_button'].on('contextmenu', stop_button_set_hotkey)
                 UI_ELEMENTS['advance_to_next_newline_button'] = ui.button("ADV. NEWLINE", icon='fast_forward', on_click=on_advance_newline_button)
-                UI_ELEMENTS['advance_to_next_newline_button'].disable()
                 UI_ELEMENTS['advance_to_next_newline_button'].on('contextmenu', advance_to_next_newline_button_set_hotkey)
                 UI_ELEMENTS['advance_to_next_token_button'] = ui.button("ADV. TOKEN", icon='fast_forward', on_click=on_advance_token_button)
-                UI_ELEMENTS['advance_to_next_token_button'].disable()
                 UI_ELEMENTS['advance_to_next_token_button'].on('contextmenu', advance_to_next_token_button_set_hotkey)
 
             ui.separator().style("height:0.175rem;")
@@ -667,6 +684,7 @@ def main():
     parser = argparse.ArgumentParser(description="Ghost Coder - MQTT-based coding assistant")
     parser.add_argument("--port", type=int, help="Specify the MQTT broker port (overrides random port selection)")
     parser.add_argument("--logging", action="store_true", help="Enable logging output")
+    parser.add_argument("--extmqtt", type=str, help="Use external MQTT broker (format: ip:port)")
     # args = parser.parse_args()
     args, _unknown = parser.parse_known_args()
 
@@ -693,33 +711,48 @@ def main():
     else:
         logger.disable("ghost_coder")
 
-    # Use specified port or get a random one
-    if args.port:
-        available_port = args.port
-        logger.info(f"Using specified port: {available_port}")
+    # Parse external MQTT broker if provided
+    if args.extmqtt:
+        try:
+            broker_host, broker_port_str = args.extmqtt.split(":")
+            available_port = int(broker_port_str)
+            logger.info(f"Using external MQTT broker at {broker_host}:{available_port}")
+        except ValueError:
+            logger.error(f"Invalid --extmqtt format: {args.extmqtt}. Expected format: ip:port")
+            print(f"Error: Invalid --extmqtt format. Expected format: ip:port")
+            return
     else:
-        available_port = get_random_available_port()
-        logger.info(f"Random port: {available_port}")
+        broker_host = "127.0.0.1"
+        # Use specified port or get a random one
+        if args.port:
+            available_port = args.port
+            logger.info(f"Using specified port: {available_port}")
+        else:
+            available_port = get_random_available_port()
+            logger.info(f"Random port: {available_port}")
 
-    # Start child processes    
+    # Start child processes
     child_processes = {}
-    
-    # Start broker process
-    logger.info("Starting broker process")
-    child_processes["broker"] = mp.Process(target=broker_process, args=(available_port, args.logging), name="broker")
-    child_processes["broker"].start()
 
-    # Wait a moment for broker to start
-    time.sleep(1)
+    # Start broker process only if not using external broker
+    if not args.extmqtt:
+        logger.info("Starting broker process")
+        child_processes["broker"] = mp.Process(target=broker_process, args=(broker_host, available_port, args.logging), name="broker")
+        child_processes["broker"].start()
+
+        # Wait a moment for broker to start
+        time.sleep(1)
+    else:
+        logger.info("Skipping internal broker - using external MQTT broker")
 
     # Start listener process
     logger.info("Starting listener process")
-    child_processes["listener"] = mp.Process(target=listener_process, args=(available_port, args.logging), name="listener")
+    child_processes["listener"] = mp.Process(target=listener_process, args=(broker_host, available_port, args.logging), name="listener")
     child_processes["listener"].start()
 
     # Start typer process
     logger.info("Starting typer process")
-    child_processes["typer"] = mp.Process(target=typer_process, args=(available_port, args.logging), name="typer")
+    child_processes["typer"] = mp.Process(target=typer_process, args=(broker_host, available_port, args.logging), name="typer")
     child_processes["typer"].start()
 
     # Setup UI in main thread
@@ -748,7 +781,7 @@ def main():
     build_ui()
 
     # Setup MQTT after UI is ready
-    ui.timer(0.5, lambda: setup_mqtt_client(available_port), once=True)
+    ui.timer(0.5, lambda: setup_mqtt_client(broker_host, available_port), once=True)
     
     # Start process monitor in background
     def monitor_processes():
@@ -764,8 +797,8 @@ def main():
                         "exit_code": cp.exitcode
                     })
                     mqtt_client.publish("APP", message, qos=1)
-    
-    ui.timer(0.5, monitor_processes)  # Check every second
+
+    ui.timer(0.5, monitor_processes)  # Check every half second
     # ui.timer(1, publish_app_state) 
     
     logger.info("Starting UI in main thread")
@@ -774,10 +807,13 @@ def main():
         native=True,
         window_size=(1600, 900),
         reload=False,
-        port=48888
     )
 
 if __name__ == "__main__":
-    mp.freeze_support()
-    mp.set_start_method("spawn", force=True)
-    main()
+    # mp.freeze_support()
+    if mp.current_process().name == 'MainProcess':
+        try:
+            mp.set_start_method("spawn")
+        except RuntimeError:
+            pass
+        main()
