@@ -684,7 +684,8 @@ def main():
     parser = argparse.ArgumentParser(description="Ghost Coder - MQTT-based coding assistant")
     parser.add_argument("--port", type=int, help="Specify the MQTT broker port (overrides random port selection)")
     parser.add_argument("--logging", action="store_true", help="Enable logging output")
-    parser.add_argument("--extmqtt", type=str, help="Use external MQTT broker (format: ip:port)")
+    parser.add_argument("--extmqtt", type=str, help="Use external MQTT broker (format: host:port)")
+    parser.add_argument("--extbroker", type=str, help="Use external MQTT broker (format: host:port)")
     # args = parser.parse_args()
     args, _unknown = parser.parse_known_args()
 
@@ -711,15 +712,16 @@ def main():
     else:
         logger.disable("ghost_coder")
 
-    # Parse external MQTT broker if provided
-    if args.extmqtt:
+    # Parse external MQTT broker if provided (support both --extbroker and --extmqtt)
+    ext_broker_arg = args.extbroker or args.extmqtt
+    if ext_broker_arg:
         try:
-            broker_host, broker_port_str = args.extmqtt.split(":")
+            broker_host, broker_port_str = ext_broker_arg.split(":")
             available_port = int(broker_port_str)
             logger.info(f"Using external MQTT broker at {broker_host}:{available_port}")
         except ValueError:
-            logger.error(f"Invalid --extmqtt format: {args.extmqtt}. Expected format: ip:port")
-            print(f"Error: Invalid --extmqtt format. Expected format: ip:port")
+            logger.error(f"Invalid --extbroker format: {ext_broker_arg}. Expected format: host:port")
+            print(f"Error: Invalid --extbroker format. Expected format: host:port (e.g., 127.0.0.1:1883)")
             return
     else:
         broker_host = "127.0.0.1"
@@ -735,7 +737,7 @@ def main():
     child_processes = {}
 
     # Start broker process only if not using external broker
-    if not args.extmqtt:
+    if not ext_broker_arg:
         logger.info("Starting broker process")
         child_processes["broker"] = mp.Process(target=broker_process, args=(broker_host, available_port, args.logging), name="broker")
         child_processes["broker"].start()
