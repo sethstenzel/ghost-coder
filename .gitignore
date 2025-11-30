@@ -14,3 +14,6 @@ output/
 
 # logs
 ghost_coder.log
+
+# application
+hotkeys.json
