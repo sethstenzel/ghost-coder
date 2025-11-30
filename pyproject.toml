@@ -29,7 +29,6 @@ dependencies = [
     "pyinput>=0.3.2",
     "pynput>=1.8.1",
     "pywebview>=6.1",
-    "starlette>=0.50.0",
 ]
 
 [project.scripts]
@@ -47,4 +46,5 @@ build-backend = "hatchling.build"
 [dependency-groups]
 dev = [
     "auto-py-to-exe>=2.48.1",
+    "deptry>=0.24.0",
 ]
