@@ -732,6 +732,8 @@ def build_ui():
 
 
     with ui.row().classes('w-full').style('position: relative; gap: 0;'):
+
+    
         # Left pane - Controls
         with ui.column().classes('p-4').style('gap: 0.1rem; width: 45%;'):
             ui.label("How to use this App:").classes('font-bold text-xl')
@@ -763,7 +765,7 @@ def build_ui():
             ui.separator().style("")
 
             UI_ELEMENTS['typing_speed_label'] = ui.label(f"Ghost Coding Speed: {UI_ELEMENTS['typing_speed_value']} ms").classes('font-bold')
-            ui.slider(min=50, max=500, step=25, value=100, on_change=update_slider_label).classes('w-full')
+            ui.slider(min=50, max=500, step=25, value=50, on_change=update_slider_label).classes('w-full')
 
             with ui.row():
                 UI_ELEMENTS["advance_to_next_newline_button"] = ui.checkbox("Auto Pause on New Line", value=False, on_change=toggle_pause_on_new_line)
@@ -794,7 +796,7 @@ def build_ui():
 
             ui.separator().style("height:0.175rem;")
             ui.separator().style("height:0.175rem;background-color:unset;")
-            ui.label("Hotkeys:").classes('font-bold')
+            ui.label("Hotkeys (right click a button to set):").classes('font-bold')
 
             with ui.row().classes('w-full'):
                 with ui.column().style("width:48.5%;"):
@@ -803,11 +805,18 @@ def build_ui():
                 with ui.column().style("width:48.5%;"):
                     UI_ELEMENTS['hotkey_labels'][4] = ui.label("Adv. Token: []").classes('font-bold')
                     UI_ELEMENTS['hotkey_labels'][3] = ui.label("Adv. to newline: []").classes('font-bold')
+            with ui.row().classes('w-full'):
+                ui.separator().style("height:0.275rem;background-color:unset;")
+                ui.label("Misc. Settings:").classes('font-bold')
+                ui.separator().style("height:0.175rem;")
+                dark = ui.dark_mode()
+                ui.switch('Dark mode').bind_value(dark)
 
         # Right pane - Source code display
         with ui.column().classes('p-4').style('width: 55%; border-left: 2px solid #ccc;'):
             ui.label("Source Code Preview:").classes('font-bold text-xl')
             UI_ELEMENTS['source_code_display'] = ui.code('').classes('w-full').style('max-height: 800px; overflow: auto; font-size: 12px;')
+
 
 
 def main():

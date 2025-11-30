@@ -1,2 +1,2 @@
 cd /d "%~dp0"
-.\.venv\Scripts\python.exe .\src\ghost_coder\app.py --port 44488
+start .\.venv\Scripts\pythonw.exe .\src\ghost_coder\app.py --port 44488
