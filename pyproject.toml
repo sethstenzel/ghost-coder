@@ -1,12 +1,26 @@
 [project]
 name = "ghost-coder"
 version = "0.1.0"
-description = "Add your description here"
+description = "Automated code playback tool for creating coding tutorials and demo videos with hotkey-driven controls."
 readme = "README.md"
 requires-python = ">=3.13"
+license = {text = "MIT"}
+authors = [
+    {name = "Seth Stenzel", email = "seth.c.stenzel@gmail.com"}
+]
+keywords = ["coding", "tutorial", "demo", "playback", "automation", "video"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Documentation",
+    "Topic :: Multimedia :: Video",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: Microsoft :: Windows",
+]
 dependencies = [
     "amqtt>=0.11.3",
-    "auto-py-to-exe>=2.48.1",
     "inputs>=0.5",
     "loguru>=0.7.3",
     "nicegui>=3.3.1",
@@ -15,5 +29,22 @@ dependencies = [
     "pyinput>=0.3.2",
     "pynput>=1.8.1",
     "pywebview>=6.1",
-    "pyzmq>=26.0.0",
+    "starlette>=0.50.0",
+]
+
+[project.scripts]
+ghost-coder = "ghost_coder.app:main"
+
+[project.urls]
+Homepage = "https://github.com/sethstenzel/ghost-coder"
+Repository = "https://github.com/sethstenzel/ghost-coder"
+Issues = "https://github.com/sethstenzel/ghost-coder/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "auto-py-to-exe>=2.48.1",
 ]

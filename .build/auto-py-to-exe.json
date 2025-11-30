@@ -1,0 +1,141 @@
+{
+ "version": "auto-py-to-exe-configuration_v1",
+ "pyinstallerOptions": [
+  {
+   "optionDest": "noconfirm",
+   "value": true
+  },
+  {
+   "optionDest": "filenames",
+   "value": "C:/s3711/git/ghost-coder/src/ghost_coder/app.py"
+  },
+  {
+   "optionDest": "onefile",
+   "value": false
+  },
+  {
+   "optionDest": "console",
+   "value": true
+  },
+  {
+   "optionDest": "icon_file",
+   "value": "C:/s3711/git/ghost-coder/.imgs/gc_icon_512x512.ico"
+  },
+  {
+   "optionDest": "name",
+   "value": "Ghost Coder"
+  },
+  {
+   "optionDest": "clean_build",
+   "value": true
+  },
+  {
+   "optionDest": "debug",
+   "value": "noarchive"
+  },
+  {
+   "optionDest": "strip",
+   "value": false
+  },
+  {
+   "optionDest": "noupx",
+   "value": true
+  },
+  {
+   "optionDest": "disable_windowed_traceback",
+   "value": false
+  },
+  {
+   "optionDest": "uac_admin",
+   "value": false
+  },
+  {
+   "optionDest": "uac_uiaccess",
+   "value": false
+  },
+  {
+   "optionDest": "argv_emulation",
+   "value": false
+  },
+  {
+   "optionDest": "bootloader_ignore_signals",
+   "value": false
+  },
+  {
+   "optionDest": "hiddenimports",
+   "value": "webview"
+  },
+  {
+   "optionDest": "hiddenimports",
+   "value": "amqtt.plugins.logging_amqtt"
+  },
+  {
+   "optionDest": "hiddenimports",
+   "value": "amqtt.plugins.authentication"
+  },
+  {
+   "optionDest": "hiddenimports",
+   "value": "amqtt.plugins.persistence"
+  },
+  {
+   "optionDest": "hiddenimports",
+   "value": "amqtt.plugins.sys"
+  },
+  {
+   "optionDest": "hiddenimports",
+   "value": "amqtt.plugins.sys.broker"
+  },
+  {
+   "optionDest": "hiddenimports",
+   "value": "multiprocessing"
+  },
+  {
+   "optionDest": "collect_data",
+   "value": "C:/s3711/git/ghost-coder/.venv/Lib/site-packages/nicegui"
+  },
+  {
+   "optionDest": "collect_all",
+   "value": "nicegui"
+  },
+  {
+   "optionDest": "hiddenimports",
+   "value": "starlette"
+  },
+  {
+   "optionDest": "collect_data",
+   "value": "C:/s3711/git/ghost-coder/.venv/Lib/site-packages/starlette"
+  },
+  {
+   "optionDest": "collect_all",
+   "value": "starlette"
+  },
+  {
+   "optionDest": "collect_all",
+   "value": "fastapi"
+  },
+  {
+   "optionDest": "collect_all",
+   "value": "uvicorn"
+  },
+  {
+   "optionDest": "hiddenimports",
+   "value": "fastapi"
+  },
+  {
+   "optionDest": "hiddenimports",
+   "value": "uvicorn"
+  },
+  {
+   "optionDest": "collect_data",
+   "value": "C:/s3711/git/ghost-coder/.venv/Lib/site-packages/uvicorn"
+  },
+  {
+   "optionDest": "collect_data",
+   "value": "C:/s3711/git/ghost-coder/.venv/Lib/site-packages/fastapi"
+  }
+ ],
+ "nonPyinstallerOptions": {
+  "increaseRecursionLimit": true,
+  "manualArguments": ""
+ }
+}

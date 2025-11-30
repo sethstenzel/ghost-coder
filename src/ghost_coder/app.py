@@ -959,7 +959,7 @@ def main():
     )
 
 if __name__ == "__main__":
-    # mp.freeze_support()
+    mp.freeze_support()
     if mp.current_process().name == 'MainProcess':
         try:
             mp.set_start_method("spawn")
