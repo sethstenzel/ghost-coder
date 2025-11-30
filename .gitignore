@@ -9,11 +9,18 @@ wheels/
 # Virtual environments
 .venv
 
-# pyinstaller
+# pyinstaller / autopytoexe
 output/
+dist/
 
 # logs
 ghost_coder.log
 
 # application
 hotkeys.json
+
+# ai
+.claude
+
+# editor
+.vscode

@@ -1,6 +1,6 @@
 [project]
 name = "ghost-coder"
-version = "0.1.0"
+version = "0.2.0"
 description = "Automated code playback tool for creating coding tutorials and demo videos with hotkey-driven controls."
 readme = "README.md"
 requires-python = ">=3.13"
