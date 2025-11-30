@@ -3,6 +3,7 @@ import multiprocessing as mp
 import argparse
 import time
 import os
+import sys
 import subprocess
 from pathlib import Path
 from loguru import logger
@@ -13,9 +14,7 @@ from ghost_coder.utils import get_random_available_port
 from ghost_coder.broker import broker_process
 from ghost_coder.listener import listener_process
 from ghost_coder.typer import typer_process
-
-
-APP_VERSION = "0.1.0"
+from ghost_coder import __version__ as APP_VERSION
 
 # Path to hotkeys configuration file
 HOTKEYS_FILE = Path(__file__).parent / "hotkeys.json"
@@ -820,6 +819,11 @@ def build_ui():
 
 
 def main():
+    # Fix for NiceGUI when running as an installed entry point
+    # NiceGUI expects sys.argv[0] to be a Python file, but entry points create wrapper scripts
+    if not sys.argv[0].endswith('.py'):
+        sys.argv[0] = __file__
+
     parser = argparse.ArgumentParser(description="Ghost Coder - MQTT-based coding assistant")
     parser.add_argument("--port", type=int, help="Specify the MQTT broker port (overrides random port selection)")
     parser.add_argument("--logging", action="store_true", help="Enable logging output")
@@ -956,6 +960,7 @@ def main():
         native=True,
         window_size=(1600, 900),
         reload=False,
+        storage_secret='ghost-coder-secret-key',
     )
 
 if __name__ == "__main__":
