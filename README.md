@@ -2,6 +2,10 @@
 
 **Automated code playback tool for creating coding tutorials and demo videos with hotkey-driven controls.**
 
+![til](.imgs/readme.gif)
+
+## So what is it?!
+
 Ghost Coder is a Windows application that allows you to load a source code file and automatically "type" it into any text editor or IDE, simulating realistic coding. Perfect for creating coding tutorials, recording demos, or practicing presentations without the stress of live coding.
 
 ## Features
