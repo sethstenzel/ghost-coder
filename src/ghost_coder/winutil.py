@@ -4,6 +4,7 @@ import ctypes
 import sys
 import time
 from ctypes import wintypes
+from typing import Optional
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -23,8 +24,11 @@ if IS_WINDOWS:
     user32.GetWindowThreadProcessId.restype = wintypes.DWORD
     user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
     kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+    user32.SystemParametersInfoW.argtypes = [wintypes.UINT, wintypes.UINT, wintypes.LPVOID, wintypes.UINT]
+    user32.GetDpiForSystem.restype = wintypes.UINT
 
 SW_RESTORE = 9
+SPI_GETWORKAREA = 0x0030
 VK_MENU = 0x12
 KEYEVENTF_KEYUP = 0x0002
 
@@ -42,6 +46,19 @@ def get_window_title(hwnd: int) -> str:
     buf = ctypes.create_unicode_buffer(length + 1)
     user32.GetWindowTextW(hwnd, buf, length + 1)
     return buf.value
+
+
+def get_work_area() -> Optional[tuple[int, int, int, int]]:
+    """Primary monitor work area (excluding the taskbar) as (left, top, width, height) in DPI-independent pixels."""
+    if not IS_WINDOWS:
+        return None
+    rect = wintypes.RECT()
+    if not user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rect), 0):
+        return None
+    # DPI-unaware processes already get scaled values and a DPI of 96.
+    scale = (user32.GetDpiForSystem() or 96) / 96
+    return (round(rect.left / scale), round(rect.top / scale),
+            round((rect.right - rect.left) / scale), round((rect.bottom - rect.top) / scale))
 
 
 def is_window(hwnd: int) -> bool:

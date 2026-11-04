@@ -15,7 +15,7 @@ import paho.mqtt.client as mqtt
 from loguru import logger
 from nicegui import app, ui
 
-from ghost_coder import APP_TITLE, __version__
+from ghost_coder import APP_TITLE, __version__, winutil
 from ghost_coder.broker import broker_process
 from ghost_coder.listener import listener_process
 from ghost_coder.typer import DEFAULT_SETTINGS, typer_process
@@ -26,6 +26,9 @@ from ghost_coder.utils import (
 
 ICON_FILE = Path(__file__).parent / "assets" / "icon.ico"
 LEGACY_HOTKEYS_FILE = Path(__file__).parent / "hotkeys.json"
+
+# Tall enough that the left-hand controls fit without scrolling (they need ~950 px).
+DEFAULT_WINDOW_SIZE = (1400, 1000)
 
 SLOT_NAMES = {1: "Play / Pause / Resume", 2: "Stop", 3: "Advance to Newline", 4: "Advance Token"}
 
@@ -688,6 +691,17 @@ def on_shutdown() -> None:
             proc.join(timeout=2)
 
 
+def initial_window_geometry() -> tuple[int, int, Optional[int], Optional[int]]:
+    """Default (width, height, x, y): shrunk to fit and centered in the primary monitor's work area."""
+    width, height = DEFAULT_WINDOW_SIZE
+    area = winutil.get_work_area()
+    if not area:
+        return width, height, None, None
+    left, top, area_w, area_h = area
+    width, height = min(width, area_w), min(height, area_h)
+    return width, height, left + (area_w - width) // 2, top + (area_h - height) // 2
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="ghost-coder", description="Ghost Coder - automated code playback")
     parser.add_argument("--port", type=int, help="port for the internal MQTT broker (default: random free port)")
@@ -745,11 +759,16 @@ def main() -> None:
     setup_mqtt_client(broker_host, broker_port)
     app.on_shutdown(on_shutdown)
 
+    width, height, x, y = initial_window_geometry()
+    if x is not None:
+        # window_args don't reach NiceGUI's window process, so position it once it exists.
+        app.on_startup(lambda: app.native.main_window.move(x, y))
+
     ui.run(
         build_ui,
         title=APP_TITLE,
         native=True,
-        window_size=(1400, 900),
+        window_size=(width, height),
         reload=False,
         show_welcome_message=False,
         favicon=ICON_FILE if ICON_FILE.exists() else None,
