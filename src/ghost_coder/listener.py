@@ -1,846 +1,383 @@
 """
-Global input listener for capturing keyboard, mouse, and gamepad events.
-Supports hotkey registration (1-8 slots) and MQTT event emission.
+Global input listener: records and detects keyboard, mouse and gamepad hotkeys.
+
+MQTT interface (topic LISTENER)
+  in   {"cmd": "register", "slot": n, "input": "keyboard|mouse|gamepad"}
+       {"cmd": "restore", "slot": n, "source": ..., "value": ..., "gamepad_name": ...}
+       {"cmd": "unregister", "slot": n} | {"cmd": "cancel"}
+  out  {"event": "listener_ready"}
+       {"event": "hotkey_triggered", "slot": n, ...}
+       {"event": "hotkey_registered" | "hotkey_registration_error" | "hotkey_registration_cancelled", ...}
+       {"event": "hotkey_restoration_success" | "hotkey_restoration_error", ...}
+  APP in {"command": "CLOSE"}
+
+Synthetic (injected) keyboard/mouse events are ignored, so keystrokes produced by the typer
+can never trigger a hotkey.
 """
 
-from pynput import keyboard, mouse
-from inputs import get_gamepad, devices
+import importlib
+import json
 import threading
 import time
-import paho.mqtt.client as Client
-from typing import Optional, Literal, Dict, Any, List
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any, Optional
+
+import inputs
+import paho.mqtt.client as mqtt
 from loguru import logger
-import json
+from pynput import keyboard, mouse
 
+from ghost_coder.utils import setup_logging, start_parent_watchdog, unique_client_id
 
-# Force refresh of device list before enumerating
-def refresh_gamepad_devices():
-    """Refresh the gamepad device list by reimporting."""
-    global devices
-    import importlib
-    import inputs
-    importlib.reload(inputs)
-    devices = inputs.devices
-    return devices
+SLOTS = range(1, 9)
+RECORD_TIMEOUT = 15.0
+TRIGGER_THRESHOLD = 128  # analog triggers report 0-255
+REJECTED_MOUSE_BUTTONS = {"left"}  # a left-click hotkey would fire on every click
 
 
 class InputSource(Enum):
-    """Types of input sources that can be monitored."""
     KEYBOARD = "keyboard"
     MOUSE = "mouse"
     GAMEPAD = "gamepad"
 
 
 @dataclass
-class HotkeyEvent:
-    """Represents a hotkey configuration."""
-    slot: int  # 1-8
+class Hotkey:
+    slot: int
     source: InputSource
-    value: Any  # Key name, button, gamepad code, etc.
-    gamepad_name: Optional[str] = None  # Specific gamepad device name (for gamepad source)
-    message: Optional[str] = None  # Custom message to emit when hotkey is triggered
-    suppress: bool = False  # Whether to suppress/capture the event (prevent OS from seeing it)
+    value: str
+    gamepad_name: Optional[str] = None
+
+
+def list_gamepads(refresh: bool = True) -> list[str]:
+    """Names of connected gamepads. Reloading `inputs` re-enumerates hot-plugged devices."""
+    global inputs
+    if refresh:
+        try:
+            inputs = importlib.reload(inputs)
+        except Exception as e:
+            logger.debug(f"Gamepad refresh failed: {e}")
+    return [getattr(dev, "name", f"Gamepad {i + 1}") for i, dev in enumerate(inputs.devices.gamepads)]
 
 
 class Listener:
-    """
-    Global input listener supporting keyboard, mouse, and gamepad inputs.
-
-    Features:
-    - Global event capture for keyboard, mouse, and gamepad
-    - 8 hotkey slots for registration
-    - MQTT event emission
-    - Configurable input source for hotkey registration
-    """
-
-    def __init__(self, mqtt_host:str, mqtt_port: int, gamepad_name: Optional[str] = None):
-        """
-        Initialize the Listener.
-
-        Args:
-            mqtt_port: Port for MQTT broker connection
-            gamepad_name: Specific gamepad to use (None = first available)
-        """
-        # State management
+    def __init__(self, mqtt_host: str, mqtt_port: int):
         self._lock = threading.Lock()
-        self._hotkeys: Dict[int, Optional[HotkeyEvent]] = {i: None for i in range(1, 9)}
-        self._running = False
+        self._hotkeys: dict[int, Optional[Hotkey]] = {i: None for i in SLOTS}
+        self._running = threading.Event()
 
         # Recording state
         self._recording_slot: Optional[int] = None
         self._recording_source: Optional[InputSource] = None
-        self._recording_gamepad_name: Optional[str] = None
-        self._recording_message: Optional[str] = None
-        self._recording_suppress: bool = False
+        self._recording_deadline = 0.0
 
-        # MQTT setup
-        self._mqtt_port = mqtt_port
+        # Inputs currently held down; triggers fire on the press edge only.
+        self._pressed: set[tuple[InputSource, str]] = set()
+        # The input just used for registration must be released before it can trigger.
+        self._just_registered: Optional[tuple[InputSource, str]] = None
+
         self._mqtt_host = mqtt_host
-        self._mqtt_client = Client.Client(Client.CallbackAPIVersion.VERSION1, "listener_client")
-        self._mqtt_client.on_connect = self._on_mqtt_connect
-        self._mqtt_client.on_message = self._on_mqtt_message
-        self._mqtt_connected = False
+        self._mqtt_port = mqtt_port
+        self._client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, unique_client_id("listener"))
+        self._client.on_connect = self._on_connect
+        self._client.on_message = self._on_message
 
-        # Select gamepad
-        self._selected_gamepad = gamepad_name
-        if self._selected_gamepad is None:
-            gamepads = self.get_gamepads()
-            if gamepads:
-                self._selected_gamepad = gamepads[0]['name']
-                logger.info(f"Auto-selected first gamepad: {self._selected_gamepad}")
-
-        # Listeners
         self._keyboard_listener: Optional[keyboard.Listener] = None
         self._mouse_listener: Optional[mouse.Listener] = None
-        self._gamepad_thread: Optional[threading.Thread] = None
 
-        # Pressed state tracking (for detecting hotkey triggers)
-        self._pressed_keys = set()
-        self._pressed_buttons = set()
-        self._pressed_gamepad = set()
+    # ------------------------------------------------------------------ MQTT
 
-        # Track inputs that were just registered (to suppress immediate trigger)
-        self._just_registered_input: Optional[tuple] = None  # (source, value)
-
-    def _on_mqtt_connect(self, client, userdata, flags, rc):
-        """Callback when MQTT client connects."""
-        if rc == 0:
-            logger.info("Listener connected to MQTT broker")
-            client.subscribe("LISTENER", qos=1)
-            logger.info("Listener subscribed to LISTENER topic")
-            self._mqtt_connected = True
-        else:
-            logger.error(f"Listener failed to connect to MQTT broker, return code: {rc}")
-
-    def _on_mqtt_message(self, client, userdata, message):
-        """Handle incoming MQTT messages on LISTENER topic."""
-        try:
-            payload = message.payload.decode()
-            logger.debug(f"Listener received message: {payload}")
-
-            # Try to parse as JSON
-            try:
-                cmd_data = json.loads(payload)
-
-                # Handle event messages - check for restore flag
-                if "event" in cmd_data:
-                    event = cmd_data.get('event')
-
-                    # Handle hotkey restoration
-                    if event == "hotkey_registered" and cmd_data.get("restore"):
-                        self._restore_hotkey(cmd_data)
-                        return
-
-                    # Ignore other event messages
-                    logger.debug(f"Ignoring event message: {event}")
-                    return
-
-                # Handle cmd-based format
-                cmd = cmd_data.get("cmd")
-                
-                if cmd == "register":
-                    # Register hotkey
-                    slot = cmd_data.get("slot")
-                    source = cmd_data.get("input")
-                    suppress = cmd_data.get("suppress", False)
-
-                    try:
-                        self.register_hotkey(slot, source, gamepad_name=self._selected_gamepad, message=None, suppress=suppress)
-                    except Exception as e:
-                        logger.error(f"Error registering hotkey: {e}")
-
-                elif cmd == "unregister":
-                    # Unregister hotkey
-                    slot = cmd_data.get("slot")
-                    self.clear_hotkey(slot)
-
-                elif cmd == "help":
-                    # Handle help command
-                    self._handle_help()
-
-                else:
-                    # Handle other commands (get_gamepads, etc.)
-                    self._handle_command(cmd_data)
-            except json.JSONDecodeError:
-                logger.warning(f"Received non-JSON message: {payload}")
-        except Exception as e:
-            logger.error(f"Error processing MQTT message: {e}")
-
-    def start(self):
-        """Start all input listeners and connect to MQTT."""
-        with self._lock:
-            if self._running:
-                logger.info("Listener already running")
-                return
-
-            self._running = True
-
-        # Connect to MQTT broker
-        try:
-            self._mqtt_client.connect(self._mqtt_host, self._mqtt_port, keepalive=60)
-            self._mqtt_client.loop_start()
-            logger.info(f"Listener connecting to MQTT broker on port {self._mqtt_port}")
-        except Exception as e:
-            logger.error(f"Failed to connect to MQTT broker: {e}")
+    def _on_connect(self, client, userdata, flags, reason_code, properties=None):
+        if reason_code.is_failure:
+            logger.error(f"Listener failed to connect to MQTT broker: {reason_code}")
             return
+        client.subscribe([("LISTENER", 1), ("APP", 1)])
+        logger.info("Listener connected and subscribed to LISTENER, APP")
+        self.emit({"event": "listener_ready"})
 
-        # Start keyboard listener
-        self._keyboard_listener = keyboard.Listener(
-            on_press=self._on_keyboard_press,
-            on_release=self._on_keyboard_release,
-            suppress=False
-        )
-        self._keyboard_listener.start()
-
-        # Start mouse listener
-        self._mouse_listener = mouse.Listener(
-            on_click=self._on_mouse_click,
-            on_scroll=self._on_mouse_scroll,
-            suppress=False
-        )
-        self._mouse_listener.start()
-
-        # Start gamepad thread
-        self._gamepad_thread = threading.Thread(target=self._gamepad_loop, daemon=True)
-        self._gamepad_thread.start()
-
-        logger.info("Listener started all input listeners")
-
-    def stop(self):
-        """Stop all input listeners."""
-        with self._lock:
-            if not self._running:
+    def _on_message(self, client, userdata, message):
+        try:
+            data = json.loads(message.payload.decode())
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return
+        if not isinstance(data, dict):
+            return
+        try:
+            if message.topic == "APP":
+                if "CLOSE" in (data.get("cmd"), data.get("command")):
+                    self.stop()
                 return
+            cmd = data.get("cmd")
+            if cmd == "register":
+                self._start_recording(data.get("slot"), data.get("input"))
+            elif cmd == "restore":
+                self._restore(data)
+            elif cmd == "unregister":
+                self._clear(data.get("slot"))
+            elif cmd == "cancel":
+                self._cancel_recording(notify=True)
+            # Messages with "event" are our own (or other clients') broadcasts: ignore.
+        except Exception:
+            logger.exception("Listener error handling message")
 
-            self._running = False
+    def emit(self, data: dict[str, Any]) -> None:
+        if self._client.is_connected():
+            self._client.publish("LISTENER", json.dumps(data), qos=1)
 
-        # Stop keyboard listener
-        if self._keyboard_listener:
-            self._keyboard_listener.stop()
-            self._keyboard_listener = None
+    # -------------------------------------------------------- registration
 
-        # Stop mouse listener
-        if self._mouse_listener:
-            self._mouse_listener.stop()
-            self._mouse_listener = None
-
-        # Stop MQTT client
-        if self._mqtt_client:
-            self._mqtt_client.loop_stop()
-            self._mqtt_client.disconnect()
-
-        logger.info("Listener stopped all input listeners")
-
-    def get_gamepads(self) -> List[Dict[str, Any]]:
-        """Get a list of available gamepad devices."""
-        # Refresh device list to detect newly connected gamepads
-        current_devices = refresh_gamepad_devices()
-        
-        gamepad_list = []
-        for i, dev in enumerate(current_devices.gamepads):
-            name = getattr(dev, 'name', f'Gamepad {i+1}')
-            gamepad_list.append({
-                'index': i,
-                'name': name,
-                'device': dev
-            })
-        return gamepad_list
-
-    def emit(self, topic: str, data: Dict[str, Any]):
-        """Emit an event via MQTT."""
-        if self._mqtt_connected:
-            message = json.dumps(data)
-            self._mqtt_client.publish(topic, message, qos=1)
-
-    def _handle_help(self):
-        """Handle the help command."""
-        help_details = {
-            "description": "Global input listener supporting keyboard, mouse, and gamepad hotkeys",
-            "features": [
-                "8 hotkey slots (1-8)",
-                "Multiple input sources (keyboard, mouse, gamepad)",
-                "Auto-select first available gamepad",
-                "Custom message attachment",
-                "Event suppression (prevent OS from seeing event)"
-            ],
-            "commands": {
-                "register": {
-                    "description": "Register a hotkey for a specific slot",
-                    "parameters": {
-                        "cmd": "'register' (required)",
-                        "slot": "Hotkey slot number (1-8, required)",
-                        "input": "Input source: 'keyboard', 'mouse', or 'gamepad' (required)",
-                        "suppress": "Whether to suppress the event (boolean, required)"
-                    },
-                    "example": {
-                        "cmd": "register",
-                        "slot": 1,
-                        "input": "keyboard",
-                        "suppress": False
-                    }
-                },
-                "unregister": {
-                    "description": "Unregister/clear a hotkey slot",
-                    "parameters": {
-                        "cmd": "'unregister' (required)",
-                        "slot": "Hotkey slot number (1-8, required)"
-                    },
-                    "example": {
-                        "cmd": "unregister",
-                        "slot": 1
-                    }
-                },
-                "help": {
-                    "description": "Get help information about the listener",
-                    "parameters": {
-                        "cmd": "'help' (required)"
-                    },
-                    "example": {
-                        "cmd": "help"
-                    }
-                }
-            },
-            "events": {
-                "hotkey_triggered": {
-                    "description": "Emitted when a registered hotkey is triggered",
-                    "topic": "LISTENER",
-                    "fields": {
-                        "event": "'hotkey_triggered'",
-                        "slot": "Hotkey slot number (1-8)",
-                        "source": "Input source ('keyboard', 'mouse', or 'gamepad')",
-                        "value": "The key/button/code that was pressed",
-                        "gamepad_name": "Gamepad device name (if source is gamepad)",
-                        "message": "Custom message (if configured)"
-                    },
-                    "example": {
-                        "event": "hotkey_triggered",
-                        "slot": 1,
-                        "source": "keyboard",
-                        "value": "a",
-                        "message": "My custom action"
-                    }
-                }
-            },
-            "workflow": [
-                "1. Send registration to LISTENER topic: {\"cmd\": \"register\", \"slot\": 1, \"input\": \"keyboard\", \"suppress\": false}",
-                "2. Press the key/button/gamepad input you want to register",
-                "3. Listener will confirm registration via log",
-                "4. When you press that input again, a 'hotkey_triggered' event is emitted to LISTENER topic",
-                "5. To unregister: send {\"cmd\": \"unregister\", \"slot\": 1}",
-                "6. To get help: send {\"cmd\": \"help\"}"
-            ]
-        }
-        help_message = {"info": help_details}
-        self.emit("LISTENER", help_message)
-        logger.info("Sent help message to LISTENER topic")
-
-    def _handle_command(self, cmd_data: Dict[str, Any]):
-        """Handle a command from MQTT LISTENER topic."""
-        cmd_type = cmd_data.get("command")
-
-        # Handle get_gamepads command
-        if cmd_type == "get_gamepads":
-            gamepads = self.get_gamepads()
-            self.emit("LISTENER_RESPONSE", {
-                "command": "get_gamepads",
-                "gamepads": [{"index": gp["index"], "name": gp["name"]} for gp in gamepads]
-            })
-        else:
-            logger.warning(f"Unknown command or invalid format: {cmd_data}")
-
-    def register_hotkey(self, slot: int, source: Literal["keyboard", "mouse", "gamepad"], gamepad_name: Optional[str] = None, message: Optional[str] = None, suppress: bool = False):
-        """Start recording a hotkey for the specified slot."""
-        if slot < 1 or slot > 8:
-            raise ValueError(f"Slot must be between 1 and 8, got {slot}")
-
-        source_enum = InputSource(source)
-
-        # If gamepad source, validate or use selected gamepad
-        if source_enum == InputSource.GAMEPAD:
-            # Refresh gamepad list to detect newly connected gamepads
-            refresh_gamepad_devices()
-
-            if gamepad_name is None:
-                gamepad_name = self._selected_gamepad
-
-            if gamepad_name is None:
-                raise ValueError("No gamepad available")
-
+    def _start_recording(self, slot: Any, source: Any) -> None:
+        try:
+            source_enum = InputSource(source)
+        except ValueError:
+            self.emit({"event": "hotkey_registration_error", "slot": slot, "error": f"Unknown input type '{source}'"})
+            return
+        if slot not in SLOTS:
+            self.emit({"event": "hotkey_registration_error", "slot": slot, "error": f"Invalid slot {slot}"})
+            return
+        if source_enum == InputSource.GAMEPAD and not list_gamepads():
+            self.emit({"event": "hotkey_registration_error", "slot": slot, "source": source, "error": "No gamepad connected"})
+            return
         with self._lock:
             self._recording_slot = slot
             self._recording_source = source_enum
-            self._recording_gamepad_name = gamepad_name
-            self._recording_message = message
-            self._recording_suppress = suppress
+            self._recording_deadline = time.monotonic() + RECORD_TIMEOUT
+        logger.info(f"Recording {source} hotkey for slot {slot}")
 
-        suppress_str = " (will suppress)" if suppress else ""
-        logger.info(f"Recording hotkey for slot {slot} from {source}{suppress_str}... Press/click now.")
-
-    def clear_hotkey(self, slot: int):
-        """Clear the hotkey configuration for a specific slot."""
+    def _cancel_recording(self, notify: bool, reason: str = "cancelled") -> None:
         with self._lock:
-            self._hotkeys[slot] = None
+            slot = self._recording_slot
+            self._recording_slot = None
+            self._recording_source = None
+        if slot is not None and notify:
+            self.emit({"event": "hotkey_registration_cancelled", "slot": slot, "reason": reason})
+            logger.info(f"Hotkey recording for slot {slot} {reason}")
 
-        logger.info(f"Cleared hotkey slot {slot}")
+    def _check_recording_timeout(self) -> None:
+        with self._lock:
+            expired = self._recording_slot is not None and time.monotonic() > self._recording_deadline
+        if expired:
+            self._cancel_recording(notify=True, reason="timed out")
 
-    def _restore_hotkey(self, data: Dict[str, Any]):
-        """Restore a hotkey from saved configuration."""
-        try:
-            slot = data.get("slot")
-            source = data.get("source")
-            value = data.get("value")
-            gamepad_name = data.get("gamepad_name")
-
-            if not slot or not source or not value:
-                logger.error(f"Invalid restore data: missing required fields")
-                return
-
-            # Convert source string to enum
-            try:
-                source_enum = InputSource(source)
-            except ValueError:
-                logger.error(f"Invalid input source: {source}")
-                return
-
-            # Validate slot
-            if slot < 1 or slot > 8:
-                logger.error(f"Invalid slot number: {slot}")
-                return
-
-            # For gamepad hotkeys, check if the gamepad is still available
-            if source_enum == InputSource.GAMEPAD:
-                # Refresh gamepad list
-                refresh_gamepad_devices()
-                gamepads = self.get_gamepads()
-                gamepad_names = [gp['name'] for gp in gamepads]
-
-                # If specific gamepad was saved, check if it's available
-                if gamepad_name and gamepad_name not in gamepad_names:
-                    logger.warning(f"Gamepad '{gamepad_name}' not found. Cannot restore hotkey for slot {slot}")
-                    # Send error back to UI
-                    error_data = {
-                        "event": "hotkey_restoration_error",
-                        "slot": slot,
-                        "source": source,
-                        "error": f"Gamepad '{gamepad_name}' not connected"
-                    }
-                    self.emit("LISTENER", error_data)
-                    return
-
-                # If no specific gamepad, check if any gamepad is available
-                if not gamepad_name and not gamepads:
-                    logger.warning(f"No gamepad available. Cannot restore hotkey for slot {slot}")
-                    error_data = {
-                        "event": "hotkey_restoration_error",
-                        "slot": slot,
-                        "source": source,
-                        "error": "No gamepad connected"
-                    }
-                    self.emit("LISTENER", error_data)
-                    return
-
-            # Create and store the hotkey
+    def _clear(self, slot: Any) -> None:
+        if slot in SLOTS:
             with self._lock:
-                hotkey = HotkeyEvent(
-                    slot=slot,
-                    source=source_enum,
-                    value=value,
-                    gamepad_name=gamepad_name,
-                    message=None,
-                    suppress=False
-                )
-                self._hotkeys[slot] = hotkey
+                self._hotkeys[slot] = None
+            logger.info(f"Cleared hotkey slot {slot}")
 
-            logger.info(f"Restored hotkey for slot {slot}: {source} - {value}")
+    def _restore(self, data: dict[str, Any]) -> None:
+        slot, source, value = data.get("slot"), data.get("source"), data.get("value")
+        gamepad_name = data.get("gamepad_name")
+        error = None
+        try:
+            source_enum = InputSource(source)
+        except ValueError:
+            source_enum, error = None, f"Invalid input source '{source}'"
+        if error is None and (slot not in SLOTS or not value):
+            error = "Invalid saved hotkey"
+        if error is None and source_enum == InputSource.GAMEPAD:
+            pads = list_gamepads()
+            if gamepad_name and gamepad_name not in pads:
+                error = f"Gamepad '{gamepad_name}' not connected"
+            elif not pads:
+                error = "No gamepad connected"
+        if error:
+            logger.warning(f"Cannot restore hotkey slot {slot}: {error}")
+            self.emit({"event": "hotkey_restoration_error", "slot": slot, "source": source, "error": error})
+            return
+        with self._lock:
+            self._hotkeys[slot] = Hotkey(slot, source_enum, str(value), gamepad_name)
+        logger.info(f"Restored hotkey slot {slot}: {source} {value}")
+        self.emit({"event": "hotkey_restoration_success", "slot": slot, "source": source, "value": value})
 
-            # Send confirmation back to UI
-            confirmation_data = {
-                "event": "hotkey_restoration_success",
-                "slot": slot,
-                "source": source,
-                "value": value
-            }
-            if gamepad_name:
-                confirmation_data["gamepad_name"] = gamepad_name
+    # ------------------------------------------------------------ dispatch
 
-            self.emit("LISTENER", confirmation_data)
-
-        except Exception as e:
-            logger.error(f"Error restoring hotkey: {e}")
-            error_data = {
-                "event": "hotkey_restoration_error",
-                "slot": data.get("slot"),
-                "source": data.get("source"),
-                "error": str(e)
-            }
-            self.emit("LISTENER", error_data)
-
-    # ==================== Keyboard Handlers ====================
-
-    def _on_keyboard_press(self, key):
-        """Handle keyboard key press events."""
-        key_str = self._format_key(key)
-        should_suppress = False
+    def _on_input(self, source: InputSource, value: str, pressed: bool, gamepad_name: Optional[str] = None,
+                  momentary: bool = False) -> None:
+        """Common handling for all inputs. momentary=True for events without a release (scroll)."""
+        ident = (source, value)
+        triggered: list[Hotkey] = []
+        registered: Optional[dict[str, Any]] = None
+        cancelled_slot = None
+        rejected: Optional[dict[str, Any]] = None
 
         with self._lock:
-            # Check if we're recording
-            if self._recording_slot and self._recording_source == InputSource.KEYBOARD:
-                # Reject escape key silently - it's reserved for canceling
-                if key_str == 'esc':
-                    logger.info(f"Escape key rejected for slot {self._recording_slot} - reserved for canceling")
+            if not pressed:
+                self._pressed.discard(ident)
+                if self._just_registered == ident:
+                    self._just_registered = None
+                return
+
+            if self._recording_slot is not None and source == InputSource.KEYBOARD and value == "esc":
+                # ESC cancels any pending registration (keyboard, mouse or gamepad).
+                cancelled_slot = self._recording_slot
+                self._recording_slot = None
+                self._recording_source = None
+                self._pressed.add(ident)
+            elif self._recording_slot is not None and self._recording_source == source:
+                slot = self._recording_slot
+                if source == InputSource.MOUSE and value in REJECTED_MOUSE_BUTTONS:
+                    rejected = {"event": "hotkey_registration_error", "slot": slot, "source": source.value,
+                                "error": "The left mouse button can't be used as a hotkey"}
+                else:
+                    self._hotkeys[slot] = Hotkey(slot, source, value, gamepad_name)
+                    registered = {"event": "hotkey_registered", "slot": slot, "source": source.value, "value": value}
+                    if gamepad_name:
+                        registered["gamepad_name"] = gamepad_name
+                    # Each input may only be bound to one slot.
+                    for other, hk in self._hotkeys.items():
+                        if other != slot and hk and hk.source == source and hk.value == value:
+                            self._hotkeys[other] = None
+                    self._just_registered = None if momentary else ident
+                if rejected is None:
                     self._recording_slot = None
                     self._recording_source = None
-                    self._recording_message = None
-                    self._recording_suppress = False
-                    return
+                if not momentary:
+                    self._pressed.add(ident)
+            else:
+                if ident in self._pressed or self._just_registered == ident:
+                    return  # key auto-repeat or still holding the registration press
+                if not momentary:
+                    self._pressed.add(ident)
+                for hk in self._hotkeys.values():
+                    if hk and hk.source == source and hk.value == value and (
+                            source != InputSource.GAMEPAD or not hk.gamepad_name or hk.gamepad_name == gamepad_name):
+                        triggered.append(hk)
 
-                hotkey = HotkeyEvent(
-                    slot=self._recording_slot,
-                    source=InputSource.KEYBOARD,
-                    value=key_str,
-                    message=self._recording_message,
-                    suppress=self._recording_suppress
-                )
-                self._hotkeys[self._recording_slot] = hotkey
-                msg_info = f" with message '{self._recording_message}'" if self._recording_message else ""
-                suppress_info = " (suppressed)" if self._recording_suppress else ""
-                logger.info(f"Registered hotkey {self._recording_slot}: Keyboard '{key_str}'{msg_info}{suppress_info}")
+        if cancelled_slot is not None:
+            self.emit({"event": "hotkey_registration_cancelled", "slot": cancelled_slot, "reason": "cancelled"})
+        if rejected:
+            self.emit(rejected)
+        if registered:
+            logger.info(f"Registered hotkey slot {registered['slot']}: {source.value} {value}")
+            self.emit(registered)
+        for hk in triggered:
+            logger.info(f"Hotkey {hk.slot} triggered: {source.value} {value}")
+            event = {"event": "hotkey_triggered", "slot": hk.slot, "source": source.value, "value": value}
+            if hk.gamepad_name:
+                event["gamepad_name"] = hk.gamepad_name
+            self.emit(event)
 
-                # Send confirmation to UI
-                confirmation_data = {
-                    "event": "hotkey_registered",
-                    "slot": self._recording_slot,
-                    "source": InputSource.KEYBOARD.value,
-                    "value": key_str
-                }
-                self.emit("LISTENER", confirmation_data)
+    # ------------------------------------------------------------ keyboard
 
-                # Mark this input as just registered to prevent immediate trigger
-                self._just_registered_input = (InputSource.KEYBOARD, key_str)
+    @staticmethod
+    def _format_key(key) -> str:
+        char = getattr(key, "char", None)
+        if char and char.isprintable():
+            return char.lower()
+        vk = getattr(key, "vk", None)
+        if isinstance(key, keyboard.KeyCode) and vk is not None:
+            # Keys pressed with Ctrl report control characters; fall back to the virtual key.
+            if 0x30 <= vk <= 0x39 or 0x41 <= vk <= 0x5A:
+                return chr(vk).lower()
+            return f"vk{vk}"
+        return str(key).replace("Key.", "")
 
-                self._recording_slot = None
-                self._recording_source = None
-                self._recording_message = None
-                self._recording_suppress = False
-                return  # Return early to prevent immediate trigger
+    def _on_key_press(self, key, injected=False):
+        if not injected:
+            self._on_input(InputSource.KEYBOARD, self._format_key(key), True)
 
-            # Track pressed state
-            self._pressed_keys.add(key_str)
+    def _on_key_release(self, key, injected=False):
+        if not injected:
+            self._on_input(InputSource.KEYBOARD, self._format_key(key), False)
 
-            # Check if this triggers any hotkey (skip if we're in recording mode for any slot)
-            if not self._recording_slot:
-                for slot, hotkey in self._hotkeys.items():
-                    if hotkey and hotkey.source == InputSource.KEYBOARD and hotkey.value == key_str:
-                        # Skip if this was just registered
-                        if self._just_registered_input == (InputSource.KEYBOARD, key_str):
-                            logger.debug(f"Skipping trigger for just-registered keyboard input: {key_str}")
-                            continue
-                        self._trigger_hotkey(slot, hotkey)
-                        if hotkey.suppress:
-                            should_suppress = True
+    # --------------------------------------------------------------- mouse
 
-        if should_suppress:
-            return False
+    def _on_click(self, _x, _y, button, pressed, injected=False):
+        if not injected:
+            self._on_input(InputSource.MOUSE, str(button).replace("Button.", ""), pressed)
 
-    def _on_keyboard_release(self, key):
-        """Handle keyboard key release events."""
-        key_str = self._format_key(key)
-
-        with self._lock:
-            self._pressed_keys.discard(key_str)
-
-            # Clear just-registered flag when the registered key is released
-            if self._just_registered_input == (InputSource.KEYBOARD, key_str):
-                self._just_registered_input = None
-                logger.debug(f"Cleared just-registered flag for keyboard input: {key_str}")
-
-    def _format_key(self, key) -> str:
-        """Format a pynput key object to a string."""
-        try:
-            if hasattr(key, 'char') and key.char:
-                return key.char
-            return str(key).replace('Key.', '')
-        except:
-            return str(key)
-
-    # ==================== Mouse Handlers ====================
-
-    def _on_mouse_click(self, _x, _y, button, pressed):
-        """Handle mouse click events."""
-        button_str = self._format_button(button)
-        
-        if not pressed:
-            with self._lock:
-                self._pressed_buttons.discard(button_str)
-
-                # Clear just-registered flag when the registered button is released
-                if self._just_registered_input == (InputSource.MOUSE, button_str):
-                    self._just_registered_input = None
-                    logger.debug(f"Cleared just-registered flag for mouse input: {button_str}")
+    def _on_scroll(self, _x, _y, dx, dy, injected=False):
+        if injected:
             return
+        if dy:
+            value = "scroll_up" if dy > 0 else "scroll_down"
+        else:
+            value = "scroll_right" if dx > 0 else "scroll_left"
+        self._on_input(InputSource.MOUSE, value, True, momentary=True)
 
-        should_suppress = False
+    # ------------------------------------------------------------- gamepad
 
-        with self._lock:
-            # Check if we're recording
-            if self._recording_slot and self._recording_source == InputSource.MOUSE:
-                hotkey = HotkeyEvent(
-                    slot=self._recording_slot,
-                    source=InputSource.MOUSE,
-                    value=button_str,
-                    message=self._recording_message,
-                    suppress=self._recording_suppress
-                )
-                self._hotkeys[self._recording_slot] = hotkey
-                msg_info = f" with message '{self._recording_message}'" if self._recording_message else ""
-                suppress_info = " (suppressed)" if self._recording_suppress else ""
-                logger.info(f"Registered hotkey {self._recording_slot}: Mouse '{button_str}'{msg_info}{suppress_info}")
+    def _gamepad_event(self, event) -> None:
+        name = getattr(event.device, "name", None)
+        code, state = event.code, event.state
+        if event.ev_type == "Key":
+            self._on_input(InputSource.GAMEPAD, code, state != 0, name)
+        elif event.ev_type == "Absolute":
+            if code.startswith("ABS_HAT"):
+                # D-pad: -1/1 while held, 0 on release (release applies to both directions).
+                if state == 0:
+                    self._on_input(InputSource.GAMEPAD, f"{code}-", False, name)
+                    self._on_input(InputSource.GAMEPAD, f"{code}+", False, name)
+                else:
+                    self._on_input(InputSource.GAMEPAD, f"{code}{'+' if state > 0 else '-'}", True, name)
+            elif code in ("ABS_Z", "ABS_RZ"):
+                self._on_input(InputSource.GAMEPAD, code, state > TRIGGER_THRESHOLD, name)
+            # Analog sticks are ignored: they drift and would register spuriously.
 
-                # Send confirmation to UI
-                confirmation_data = {
-                    "event": "hotkey_registered",
-                    "slot": self._recording_slot,
-                    "source": InputSource.MOUSE.value,
-                    "value": button_str
-                }
-                self.emit("LISTENER", confirmation_data)
-
-                # Mark this input as just registered to prevent immediate trigger
-                self._just_registered_input = (InputSource.MOUSE, button_str)
-
-                self._recording_slot = None
-                self._recording_source = None
-                self._recording_message = None
-                self._recording_suppress = False
-                return  # Return early to prevent immediate trigger
-
-            # Track pressed state
-            self._pressed_buttons.add(button_str)
-
-            # Check if this triggers any hotkey (skip if we're in recording mode for any slot)
-            if not self._recording_slot:
-                for slot, hotkey in self._hotkeys.items():
-                    if hotkey and hotkey.source == InputSource.MOUSE and hotkey.value == button_str:
-                        # Skip if this was just registered
-                        if self._just_registered_input == (InputSource.MOUSE, button_str):
-                            logger.debug(f"Skipping trigger for just-registered mouse input: {button_str}")
-                            continue
-                        self._trigger_hotkey(slot, hotkey)
-                        if hotkey.suppress:
-                            should_suppress = True
-
-        if should_suppress:
-            return False
-
-    def _on_mouse_scroll(self, _x, _y, dx, dy):
-        """Handle mouse scroll events."""
-        scroll_event = f"scroll_{'up' if dy > 0 else 'down'}" if dy != 0 else f"scroll_{'right' if dx > 0 else 'left'}"
-        should_suppress = False
-
-        with self._lock:
-            # Check if we're recording
-            if self._recording_slot and self._recording_source == InputSource.MOUSE:
-                hotkey = HotkeyEvent(
-                    slot=self._recording_slot,
-                    source=InputSource.MOUSE,
-                    value=scroll_event,
-                    message=self._recording_message,
-                    suppress=self._recording_suppress
-                )
-                self._hotkeys[self._recording_slot] = hotkey
-                msg_info = f" with message '{self._recording_message}'" if self._recording_message else ""
-                suppress_info = " (suppressed)" if self._recording_suppress else ""
-                logger.info(f"Registered hotkey {self._recording_slot}: Mouse '{scroll_event}'{msg_info}{suppress_info}")
-
-                # Send confirmation to UI
-                confirmation_data = {
-                    "event": "hotkey_registered",
-                    "slot": self._recording_slot,
-                    "source": InputSource.MOUSE.value,
-                    "value": scroll_event
-                }
-                self.emit("LISTENER", confirmation_data)
-
-                # Mark this input as just registered to prevent immediate trigger
-                self._just_registered_input = (InputSource.MOUSE, scroll_event)
-
-                self._recording_slot = None
-                self._recording_source = None
-                self._recording_message = None
-                self._recording_suppress = False
-                return
-
-            # Check if this triggers any hotkey (skip if we're in recording mode for any slot)
-            if not self._recording_slot:
-                for slot, hotkey in self._hotkeys.items():
-                    if hotkey and hotkey.source == InputSource.MOUSE and hotkey.value == scroll_event:
-                        # Skip if this was just registered
-                        if self._just_registered_input == (InputSource.MOUSE, scroll_event):
-                            logger.debug(f"Skipping trigger for just-registered mouse scroll: {scroll_event}")
-                            # Clear the flag immediately for scroll events (they don't have a release)
-                            self._just_registered_input = None
-                            continue
-                        self._trigger_hotkey(slot, hotkey)
-                        if hotkey.suppress:
-                            should_suppress = True
-
-        if should_suppress:
-            return False
-
-    def _format_button(self, button) -> str:
-        """Format a pynput button object to a string."""
-        return str(button).replace('Button.', '')
-
-    # ==================== Gamepad Handlers ====================
-
-    def _gamepad_loop(self):
-        """Polling loop for gamepad events."""
-        while True:
-            with self._lock:
-                if not self._running:
-                    break
-
+    def _gamepad_loop(self) -> None:
+        last_refresh = 0.0
+        while self._running.is_set():
             try:
-                events = get_gamepad()
-                for event in events:
-                    if event.ev_type not in ('Key', 'Absolute'):
-                        continue
-
-                    if event.state == 0:
-                        # Handle release
-                        with self._lock:
-                            self._pressed_gamepad.discard(event.code)
-
-                            # Clear just-registered flag when the registered button is released
-                            if self._just_registered_input == (InputSource.GAMEPAD, event.code):
-                                self._just_registered_input = None
-                                logger.debug(f"Cleared just-registered flag for gamepad input: {event.code}")
-                        continue
-
-                    gamepad_code = event.code
-                    gamepad_device_name = getattr(event.device, 'name', None)
-
-                    # Only process if this is the selected gamepad
-                    if self._selected_gamepad and gamepad_device_name != self._selected_gamepad:
-                        continue
-
-                    with self._lock:
-                        # Check if we're recording
-                        if self._recording_slot and self._recording_source == InputSource.GAMEPAD:
-                            hotkey = HotkeyEvent(
-                                slot=self._recording_slot,
-                                source=InputSource.GAMEPAD,
-                                value=gamepad_code,
-                                gamepad_name=gamepad_device_name,
-                                message=self._recording_message,
-                                suppress=self._recording_suppress
-                            )
-                            self._hotkeys[self._recording_slot] = hotkey
-                            msg_info = f" with message '{self._recording_message}'" if self._recording_message else ""
-                            suppress_info = " (suppressed)" if self._recording_suppress else ""
-                            logger.info(f"Registered hotkey {self._recording_slot}: Gamepad '{gamepad_device_name}' button '{gamepad_code}'{msg_info}{suppress_info}")
-
-                            # Send confirmation to UI
-                            confirmation_data = {
-                                "event": "hotkey_registered",
-                                "slot": self._recording_slot,
-                                "source": InputSource.GAMEPAD.value,
-                                "value": gamepad_code,
-                                "gamepad_name": gamepad_device_name
-                            }
-                            self.emit("LISTENER", confirmation_data)
-
-                            # Mark this input as just registered to prevent immediate trigger
-                            self._just_registered_input = (InputSource.GAMEPAD, gamepad_code)
-
-                            self._recording_slot = None
-                            self._recording_source = None
-                            self._recording_gamepad_name = None
-                            self._recording_message = None
-                            self._recording_suppress = False
-                            continue
-
-                        # Track pressed state
-                        if gamepad_code not in self._pressed_gamepad:
-                            self._pressed_gamepad.add(gamepad_code)
-
-                            # Check if this triggers any hotkey (skip if we're in recording mode for any slot)
-                            if not self._recording_slot:
-                                for slot, hotkey in self._hotkeys.items():
-                                    if (hotkey and
-                                        hotkey.source == InputSource.GAMEPAD and
-                                        hotkey.value == gamepad_code and
-                                        (hotkey.gamepad_name is None or hotkey.gamepad_name == gamepad_device_name)):
-                                        # Skip if this was just registered
-                                        if self._just_registered_input == (InputSource.GAMEPAD, gamepad_code):
-                                            logger.debug(f"Skipping trigger for just-registered gamepad input: {gamepad_code}")
-                                            continue
-                                        self._trigger_hotkey(slot, hotkey)
-
-            except Exception as e:
-                # No gamepad connected or other error
+                if not inputs.devices.gamepads:
+                    raise inputs.UnpluggedError()
+                for event in inputs.get_gamepad():
+                    self._gamepad_event(event)
+            except Exception:
+                # No gamepad (or it was unplugged): poll for hot-plugged devices every few seconds.
                 time.sleep(0.5)
-                continue
+                if time.monotonic() - last_refresh > 3:
+                    last_refresh = time.monotonic()
+                    list_gamepads()
 
-            time.sleep(0.01)
+    # ----------------------------------------------------------- lifecycle
 
-    # ==================== Hotkey Triggering ====================
+    def start(self) -> bool:
+        try:
+            self._client.connect(self._mqtt_host, self._mqtt_port, keepalive=60)
+        except Exception as e:
+            logger.error(f"Listener failed to connect to MQTT broker: {e}")
+            return False
+        self._client.loop_start()
+        self._running.set()
 
-    def _trigger_hotkey(self, slot: int, hotkey: HotkeyEvent):
-        """Trigger a hotkey event."""
-        logger.info(f"Hotkey {slot} pressed: {hotkey.source.value} '{hotkey.value}'")
+        self._keyboard_listener = keyboard.Listener(on_press=self._on_key_press, on_release=self._on_key_release)
+        self._keyboard_listener.start()
+        self._mouse_listener = mouse.Listener(on_click=self._on_click, on_scroll=self._on_scroll)
+        self._mouse_listener.start()
+        threading.Thread(target=self._gamepad_loop, name="gamepad", daemon=True).start()
+        logger.info("Listener started")
+        return True
 
-        # Emit MQTT event to LISTENER topic
-        event_data = {
-            "event": "hotkey_triggered",
-            "slot": slot,
-            "source": hotkey.source.value,
-            "value": hotkey.value
-        }
-        if hotkey.gamepad_name:
-            event_data["gamepad_name"] = hotkey.gamepad_name
-        if hotkey.message:
-            event_data["message"] = hotkey.message
-
-        self.emit("LISTENER", event_data)
-
-
-def listener_process(host: str, port: int, enable_logging: bool = False):
-    """Run the listener as a separate process."""
-    if enable_logging:
-        logger.configure(
-            handlers=[
-                {
-                    "sink": "ghost_coder.log",
-                    "format": "[{time:YYYY-MM-DD HH:mm:ss}] {level} {name}:{function}:{line} - {message}",
-                    "rotation": "10 MB",
-                    "retention": "7 days",
-                    "level": "DEBUG"
-                },
-                {
-                    "sink": lambda msg: print(msg, end=""),
-                    "format": "[{time:YYYY-MM-DD HH:mm:ss}] {level} {name}:{function}:{line} - {message}",
-                    "level": "DEBUG"
-                }
-            ]
-        )
-        logger.enable("ghost_coder")
-    else:
-        logger.disable("ghost_coder")
-    
-    logger.info("Starting Listener process")
-    listener = Listener(mqtt_host=host, mqtt_port=port)
-    listener.start()
-
-    try:
-        # Keep the process running
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("Listener interrupted")
-    finally:
-        listener.stop()
+    def stop(self) -> None:
+        if not self._running.is_set():
+            return
+        self._running.clear()
+        for listener in (self._keyboard_listener, self._mouse_listener):
+            if listener:
+                listener.stop()
+        self._client.loop_stop()
+        self._client.disconnect()
         logger.info("Listener stopped")
 
+    def wait(self) -> None:
+        while self._running.is_set():
+            time.sleep(0.5)
+            self._check_recording_timeout()
+
+
+def listener_process(host: str, port: int, enable_logging: bool = False) -> None:
+    """Entry point for the listener child process."""
+    setup_logging(enable_logging)
+    logger.info("Starting Listener process")
+    listener = Listener(mqtt_host=host, mqtt_port=port)
+    if not listener.start():
+        return
+    start_parent_watchdog(listener.stop)
+    try:
+        listener.wait()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        listener.stop()

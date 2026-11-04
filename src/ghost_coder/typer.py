@@ -1,646 +1,483 @@
 """
-Typer process for automated text input simulation.
-Listens for commands on MQTT TYPER topic and monitors STATE for configuration.
+Typer process: replays a parsed source file as simulated keystrokes into a target window.
+
+MQTT interface
+  TYPER (in)   {"cmd": "load_file", "file": path} | play | pause | resume | stop |
+               advance_newline | advance_token
+  STATE (in)   {"state-data": {...settings...}}
+  STATE (out)  {"cmd": "update_state", "key": "play_status", "value": "playing|paused|stopped"}
+  UI    (out)  {"notify": str, "type": str} | {"event": "progress"|"countdown"|"target"|"typer_ready", ...}
+  APP   (in)   {"command": "CLOSE"}
+
+The typer is the single source of truth for playback status; the UI sends commands and mirrors
+the status it reports back.
 """
 
-import time
 import json
-import threading
 import random
-from ghost_coder.data import SingleKey, MultiKeys, TimedPause, MouseScroll, RepeatedKey, TextData
-from pynput.keyboard import Key
-from pynput.keyboard import Controller as KbController
-from pynput.mouse import Controller as MsController
-import pygetwindow as gw
-import paho.mqtt.client as Client
+import threading
+import time
+from typing import Any, Optional
+
+import paho.mqtt.client as mqtt
 from loguru import logger
-from typing import Optional, Dict, Any
+from pynput.keyboard import Controller as KbController
+from pynput.keyboard import Key
+from pynput.mouse import Controller as MsController
+
+from ghost_coder import APP_TITLE, winutil
+from ghost_coder.data import (
+    KeyCombo, KeyPress, MouseScroll, Newline, PausePoint, Text, TimedPause, Token, describe, parse,
+)
+from ghost_coder.utils import setup_logging, start_parent_watchdog, unique_client_id
+
+DEFAULT_SETTINGS: dict[str, Any] = {
+    "typing_speed_value": 50,
+    "varied_coding_speed": False,
+    "start_delay": 5,
+    "pause_on_new_line": False,
+    "start_playback_paused": False,
+    "auto_home_on_newline": True,
+    "control_on_newline": True,
+    "replace_quad_spaces_with_tab": True,
+    "pause_on_window_not_focused": True,
+    "refocus_window_on_resume": True,
+}
+
+PROGRESS_INTERVAL = 0.2
+
+
+class Cancelled(Exception):
+    """Raised inside the playback thread when its session was stopped or replaced."""
 
 
 class Typer:
-    """
-    Automated text input simulator with MQTT interface.
+    def __init__(self, mqtt_host: str, mqtt_port: int):
+        self._lock = threading.RLock()
+        self._wake = threading.Condition(self._lock)
 
-    Features:
-    - Load text files and parse into tokens
-    - Simulate keyboard and mouse actions
-    - Window focus detection and pausing
-    - Configurable speed and behavior
-    - MQTT command interface on TYPER topic
-    - State synchronization via STATE topic
-    """
+        self.settings: dict[str, Any] = dict(DEFAULT_SETTINGS)
+        self.file_path: Optional[str] = None
 
-    def __init__(self, mqtt_host, mqtt_port: int):
-        """
-        Initialize the Typer.
+        # Playback state (guarded by _lock)
+        self.status = "stopped"
+        self._session = 0
+        self._advance_newline = False
+        self._advance_tokens = 0
+        self._refocus_pending = False
+        self.hwnd = 0
+        self._last_progress = 0.0
 
-        Args:
-            mqtt_port: Port for MQTT broker connection
-        """
-        # Text data
-        self.text_tokens = None
-        self.text_tokens_preview = []
-        self.original_text_tokens = None  # Store original for reset
-        self.current_file_path = None  # Store file path for reload
-
-        # Playback state
-        self.play = False
-        self.paused = False
-        self.advance_to_newline = 0
-        self.advance_token = 0
-        self.play_in_session = False
-        self.resumed = 0
-
-        # Configuration (will be synced from STATE)
-        self.play_status = "stopped"
-        self.speed = 50
-        self.pause_on_new_line = True
-        self.pause_on_window_not_focused = True
-        self.refocus_window_on_resume = True
-        self.start_playback_paused = False
-        self.auto_home_on_newline = False
-        self.control_on_newline = False
-        self.replace_quad_spaces_with_tab = True
-        self.varied_coding_speed = False
-
-        # Window handle
-        self.hwnd = None
-
-        # Input controllers
         self.kb = KbController()
         self.ms = MsController()
 
-        # MQTT setup
-        self._mqtt_port = mqtt_port
         self._mqtt_host = mqtt_host
-        self._mqtt_client = Client.Client(Client.CallbackAPIVersion.VERSION1, "typer_client")
-        self._mqtt_client.on_connect = self._on_mqtt_connect
-        self._mqtt_client.on_message = self._on_mqtt_message
-        self._mqtt_connected = False
-        self._running = False
+        self._mqtt_port = mqtt_port
+        self._client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, unique_client_id("typer"))
+        self._client.on_connect = self._on_connect
+        self._client.on_message = self._on_message
+        self._running = threading.Event()
 
-        # State sync thread
-        self._state_sync_thread: Optional[threading.Thread] = None
-        self._state_values = {}
+    # ------------------------------------------------------------------ MQTT
 
-        # Playback thread
-        self._playback_thread: Optional[threading.Thread] = None
+    def _on_connect(self, client, userdata, flags, reason_code, properties=None):
+        if reason_code.is_failure:
+            logger.error(f"Typer failed to connect to MQTT broker: {reason_code}")
+            return
+        client.subscribe([("TYPER", 1), ("STATE", 1), ("APP", 1)])
+        logger.info("Typer connected and subscribed to TYPER, STATE, APP")
+        self.publish("UI", {"event": "typer_ready"})
 
-    def _on_mqtt_connect(self, client, userdata, flags, rc):
-        """Callback when MQTT client connects."""
-        if rc == 0:
-            logger.info("Typer connected to MQTT broker")
-            client.subscribe("TYPER", qos=1)
-            client.subscribe("STATE", qos=1)
-            client.subscribe("APP", qos=1)
-            logger.info("Typer subscribed to TYPER, STATE, and APP topics")
-            self._mqtt_connected = True
-        else:
-            logger.error(f"Typer failed to connect to MQTT broker, return code: {rc}")
-
-    def _on_mqtt_message(self, client, userdata, message):
-        """Handle incoming MQTT messages."""
+    def _on_message(self, client, userdata, message):
         try:
-            payload = message.payload.decode()
-            logger.debug(f"Typer received message on {message.topic}: {payload}")
-
-            # Handle CLOSE command on APP topic
+            data = json.loads(message.payload.decode())
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            logger.warning(f"Typer ignoring non-JSON message on {message.topic}")
+            return
+        if not isinstance(data, dict):
+            return
+        try:
             if message.topic == "APP":
-                try:
-                    cmd_data = json.loads(payload)
-                    if cmd_data.get("cmd") == "CLOSE" or cmd_data.get("command") == "CLOSE":
-                        logger.info("Typer received CLOSE command")
-                        self.stop()
-                        return
-                except json.JSONDecodeError:
-                    pass
-                return
+                if "CLOSE" in (data.get("cmd"), data.get("command")):
+                    logger.info("Typer received CLOSE")
+                    self.stop()
+            elif message.topic == "STATE":
+                if isinstance(data.get("state-data"), dict):
+                    self._apply_settings(data["state-data"])
+            elif message.topic == "TYPER":
+                self._handle_command(data)
+        except Exception:
+            logger.exception("Typer error handling message")
 
-            # Handle STATE topic messages (state updates)
-            if message.topic == "STATE":
-                try:
-                    state_data = json.loads(payload)
-                    if "state-data" in state_data and isinstance(state_data["state-data"], dict):
-                        logger.info("Typer received new STATE Data")
-                        self._state_values.update(state_data["state-data"])
+    def publish(self, topic: str, data: dict[str, Any]) -> None:
+        if self._client.is_connected():
+            self._client.publish(topic, json.dumps(data), qos=1)
 
-                        self._sync_from_state()
-                        logger.info("Typer state synced")
-                except json.JSONDecodeError:
-                    pass
-                return
+    def notify(self, message: str, kind: str = "info") -> None:
+        logger.info(f"Notify UI: {message}")
+        self.publish("UI", {"notify": message, "type": kind})
 
-            # Handle TYPER topic commands
-            try:
-                cmd_data = json.loads(payload)
-                cmd = cmd_data.get("cmd")
+    # -------------------------------------------------------------- settings
 
-                if cmd == "load_file":
-                    self._handle_load_file(cmd_data)
-                elif cmd == "data":
-                    self._handle_data()
-                elif cmd == "play":
-                    self._handle_play()
-                elif cmd == "stop":
-                    self._handle_stop()
-                elif cmd == "pause":
-                    self._handle_pause()
-                elif cmd == "advance_newline":
-                    self._handle_advance_newline()
-                elif cmd == "advance_token":
-                    self._handle_advance_token()
-                else:
-                    logger.warning(f"Unknown command: {cmd}")
+    def _apply_settings(self, state: dict[str, Any]) -> None:
+        with self._lock:
+            for key in DEFAULT_SETTINGS:
+                if key in state and state[key] is not None:
+                    self.settings[key] = state[key]
+        logger.debug(f"Typer settings: {self.settings}")
 
-            except json.JSONDecodeError:
-                logger.warning(f"Received non-JSON message: {payload}")
-        except Exception as e:
-            logger.error(f"Error processing MQTT message: {e}")
+    def _speed_ms(self) -> float:
+        base = max(10, int(self.settings["typing_speed_value"]))
+        if self.settings["varied_coding_speed"]:
+            return max(10, base + random.randint(-50, 150))
+        return base
 
-    def _handle_load_file(self, cmd_data: Dict[str, Any]):
-        """Handle load_file command."""
-        file_path = cmd_data.get("file")
+    # -------------------------------------------------------------- commands
 
-        if not file_path:
-            error_msg = {"error": "Missing 'file' parameter"}
-            self.publish("UI", error_msg)
-            logger.error("load_file command missing 'file' parameter")
-            return
-
-        try:
-            self.initialize_text_data(file_path)
-            result = {"result": "ok", "message": f"Loaded file: {file_path}"}
-            self.publish("TYPER", result)
-            logger.info(f"Successfully loaded file: {file_path}")
-        except Exception as e:
-            error_msg = {"error": f"Failed to load file: {str(e)}"}
-            self.publish("UI", error_msg)
-            logger.error(f"Error loading file {file_path}: {e}")
-
-    def _handle_data(self):
-        """Handle data command - return text tokens preview."""
-        if self.text_tokens_preview:
-            result = {"result": self.text_tokens_preview}
+    def _handle_command(self, data: dict[str, Any]) -> None:
+        cmd = data.get("cmd")
+        if cmd == "load_file":
+            self._load_file(data.get("file"))
+        elif cmd == "play":
+            self._play()
+        elif cmd == "pause":
+            self._pause()
+        elif cmd == "resume":
+            self._resume()
+        elif cmd == "stop":
+            self._stop_playback()
+        elif cmd == "advance_newline":
+            self._advance(newline=True)
+        elif cmd == "advance_token":
+            self._advance(newline=False)
         else:
-            result = {"result": [], "warning": "No data loaded"}
+            logger.warning(f"Typer unknown command: {cmd}")
 
-        self.publish("TYPER", result)
-        logger.debug(f"Sent data with {len(self.text_tokens_preview)} tokens")
+    def _read_tokens(self, path: str) -> list[Token]:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            text = f.read()
+        return parse(text, replace_quad_spaces_with_tab=bool(self.settings["replace_quad_spaces_with_tab"]))
 
-    def _handle_play(self):
-        """Handle play command - start typing."""
-        if not self.text_tokens:
-            error_msg = {"error": "No data loaded. Use load_file first."}
-            self.publish("TYPER", error_msg)
-            logger.error("Cannot play: no data loaded")
+    def _load_file(self, path: Optional[str]) -> None:
+        if not path:
+            self.notify("Load failed: no file given", "negative")
             return
-
-        logger.warning("Playback already running")
-        if self.play_in_session:
-            self.play = True
-            self.paused = False
-            self.resumed = 1
-            self._update_play_status("playing")
-        else:
-            self.play = True
-            self.paused = False
-
-            # Update play_status state to playing
-            self._update_play_status("playing")
-
-            # Start playback in a separate thread
-            self._playback_thread = threading.Thread(target=self._play_with_delay, daemon=True)
-            self._playback_thread.start()
-
-            notify = {"cmd": "notify", "message": "Playback will start in 5 seconds"}
-            self.publish("UI", notify)
-            logger.info("Playback will start in 5 seconds")
-
-    def _handle_stop(self):
-        """Handle stop command."""
-        self.play = False
-        self.paused = False
-        self.play_in_session = False
-        self.resumed = 0
-
-        # Reset to beginning of file
-        self._reset_to_beginning()
-
-        # Update play_status state to stopped
-        self._update_play_status("stopped")
-
-        logger.info("Stopped playback and reset to beginning")
-
-    def _handle_pause(self):
-        """Handle pause command."""
-        self.paused = not self.paused
-        state = "paused" if self.paused else "playing"
-
-        # If resuming (unpausing) and refocus is enabled, focus the window first and wait
-        if not self.paused and self.refocus_window_on_resume:  # Now playing
-            self.focus_window()
-            logger.info("Focused window before resuming playback, waiting 2 seconds...")
-            time.sleep(2)
-            logger.info("Resuming playback now")
-
-        # Update play_status state
-        self._update_play_status(state)
-
-        result = {"result": "ok", "message": f"Playback {state}"}
-        self.publish("TYPER", result)
-        logger.info(f"Playback {state}")
-
-    def _handle_advance_newline(self):
-        """Handle advance_newline command - advance to next newline."""
-        self.advance_to_newline += 1
-        result = {"result": "ok", "message": "Advancing to next newline"}
-        self.publish("TYPER", result)
-        logger.info("Advance to newline triggered")
-
-    def _handle_advance_token(self):
-        """Handle advance_token command - advance by one token."""
-        self.advance_token += 1
-        result = {"result": "ok", "message": "Advancing by one token"}
-        self.publish("TYPER", result)
-        logger.info("Advance token triggered")
-
-    def _sync_from_state(self):
-        """Sync configuration from STATE values."""
-        if "play_status" in self._state_values:
-            self.play_status = self._state_values["play_status"]
-            if self.play_status == "playing":
-                self.play = True
-                self.paused = False
-            elif self.play_status == "paused":
-                self.play = True
-                self.paused = True
-            else:
-                self.play = False
-                self.paused = False
-        if "speed" in self._state_values:
-            self.speed = self._state_values["speed"]
-        if "pause_on_new_line" in self._state_values:
-            self.pause_on_new_line = self._state_values["pause_on_new_line"]
-        if "pause_on_window_not_focused" in self._state_values:
-            self.pause_on_window_not_focused = self._state_values["pause_on_window_not_focused"]
-        if "refocus_window_on_resume" in self._state_values:
-            self.refocus_window_on_resume = self._state_values["refocus_window_on_resume"]
-        if "start_playback_paused" in self._state_values:
-            self.start_playback_paused = self._state_values["start_playback_paused"]
-        if "auto_home_on_newline" in self._state_values:
-            self.auto_home_on_newline = self._state_values["auto_home_on_newline"]
-        if "control_on_newline" in self._state_values:
-            self.control_on_newline = self._state_values["control_on_newline"]
-        if "replace_quad_spaces_with_tab" in self._state_values:
-            self.replace_quad_spaces_with_tab = self._state_values["replace_quad_spaces_with_tab"]
-        if "varied_coding_speed" in self._state_values:
-            self.varied_coding_speed = self._state_values["varied_coding_speed"]
-
-    def _update_window_handle(self):
-        """Update the window handle based on window_title."""
-        if self.window_title:
-            try:
-                windows = gw.getWindowsWithTitle(self.window_title)
-                if windows:
-                    self.hwnd = windows[0]._hWnd
-                    logger.info(f"Updated window handle for: {self.window_title}")
-            except Exception as e:
-                logger.error(f"Error getting window handle: {e}")
-
-
-    def initialize_text_data(self, file_path: str):
-        """Load and parse a text file into tokens."""
-        with open(file_path, 'r', encoding='utf-8') as f:
-            file_data = f.read()
-            text_data = TextData(file_data, replace_quad_spaces_with_tab=self.replace_quad_spaces_with_tab)
-            self.text_tokens = text_data.text_tokens
-            self.original_text_tokens = text_data.text_tokens.copy()  # Save original
-            self.text_tokens_preview = ['[ ' + str(x) + ' ]' for x in text_data.text_tokens]
-            self.current_file_path = file_path  # Save file path
-
-    def get_typing_speed(self):
-        """Get the typing speed with optional random variation.
-
-        Returns the base speed with random variation of -50ms to +150ms if varied_coding_speed is enabled.
-        """
-        if self.varied_coding_speed:
-            # Random variation between -50ms and +150ms
-            variation = random.randint(-50, 150)
-            varied_speed = max(1, self.speed + variation)  # Ensure speed is at least 1ms
-            return varied_speed
-        return self.speed
-
-    def type_token(self, token):
-        """Type a single token."""
-        kb = self.kb
-        ms = self.ms
-        token_completed = False
-        # Get typing speed once per token for consistent timing within the token
-        typing_speed = self.get_typing_speed()
-
-        while not token_completed and self.play:
-            if isinstance(token, MultiKeys):
-                if self.check_window_focused(pause_if_not=True):
-                    # Press all keys in order
-                    for key in token.keys:
-                        self.focus_window()
-                        if hasattr(Key, key):
-                            kb.press(getattr(Key, key))
-                        else:
-                            kb.press(key)
-                    time.sleep(typing_speed/1000/2)
-                    # Release all keys in reverse order (for proper modifier key handling)
-                    for key in reversed(token.keys):
-                        self.focus_window()
-                        if hasattr(Key, key):
-                            kb.release(getattr(Key, key))
-                        else:
-                            kb.release(key)
-                    token_completed = True
-            elif isinstance(token, SingleKey):
-                if self.check_window_focused(pause_if_not=True):
-                    if token.key == "enter" and self.control_on_newline:
-                        kb.press(Key.ctrl)
-                        kb.press(getattr(Key, token.key))
-                        time.sleep(typing_speed/1000)
-                        kb.release(getattr(Key, token.key))
-                        kb.release(Key.ctrl)
-                    elif token.key == "atpause":
-                        # <<PAUSE>> should always pause and consume advance_to_newline
-                        if self.advance_to_newline > 0:
-                            self.advance_to_newline -= 1
-                        self.paused = True
-                        self._update_play_status("paused")
-                    else:
-                        kb.press(getattr(Key, token.key))
-                        time.sleep(typing_speed/1000)
-                        kb.release(getattr(Key, token.key))
-
-                    if token.key == "enter" and self.auto_home_on_newline:
-                        kb.press(Key.home)
-                        time.sleep(typing_speed/1000)
-                        kb.release(Key.home)
-
-                    if (token.key == "enter" and self.pause_on_new_line) or (token.key == "enter" and self.advance_to_newline > 0):
-                        if self.advance_to_newline > 0:
-                            self.advance_to_newline -= 1
-                        self.paused = True
-                        self._update_play_status("paused")
-                    token_completed = True
-
-            elif isinstance(token, TimedPause):
-                if self.check_window_focused(pause_if_not=True):
-                    time.sleep(token.time)
-                    token_completed = True
-            elif isinstance(token, MouseScroll):
-                if self.check_window_focused(pause_if_not=True):
-                    for _ in range(token.scroll_count):
-                        ms.scroll(0, token.scroll_direction)
-                        time.sleep(typing_speed/1000/2)
-                    token_completed = True
-            elif isinstance(token, RepeatedKey):
-                if self.check_window_focused(pause_if_not=True):
-                    self.focus_window()
-                    for _ in range(token.count):
-                        kb.press(getattr(Key, token.key))
-                        time.sleep(typing_speed/1000)
-                        kb.release(getattr(Key, token.key))
-                        time.sleep(typing_speed/1000/4)  # Small delay between repeated presses
-                    token_completed = True
-            else:
-                for char in token:
-                    char_completed = False
-                    while not char_completed:
-                        if (
-                            (self.play and self.resumed > 0) or
-                            (self.check_window_focused(pause_if_not=True) and not self.paused) or
-                            (self.play and self.paused and self.advance_to_newline > 0) or
-                            (self.play and self.paused and self.advance_token > 0)
-                        ):
-                            self.focus_window()
-                            if self.resumed:
-                                self.resumed = 0
-                            kb.press(char)
-                            time.sleep(typing_speed/1000)
-                            kb.release(char)
-                            char_completed = True
-                        time.sleep(0.01)
-                token_completed = True
-        time.sleep(0.01)
-        return token_completed
-
-    def _play_with_delay(self):
-        """Wait 5 seconds then start typing."""
-        logger.info("Waiting 5 seconds before starting playback...")
-        time.sleep(5)
-
-        # Capture the currently focused window
-        self._capture_active_window()
-        if "Ghost Coder" in self.window_title:
-            self.play = False
-            self.paused = False
-            self.play_status = "stopped"
-            logger.error("Focus window is Ghost Coder... no new window was given focus, please")
-
-            state_msg = {"cmd": "update_state", "key": "play_status", "value": self.play_status}
-            self.publish("STATE", state_msg)
-            logger.debug(f"Updated play_status to '{self.play_status}'")
-
-            notify = {"notify": "Focus window is Ghost Coder... no new window was given focus."}
-            self.publish("UI", notify)
-            
-            
-        logger.info("Starting playback now")
-        self.type_text_tokens()
-
-    def _capture_active_window(self):
-        """Capture the currently active window as the target."""
         try:
-            active_window = gw.getActiveWindow()
-            if active_window:
-                self.hwnd = active_window._hWnd
-                self.window_title = active_window.title
-                logger.info(f"Captured active window: '{self.window_title}' (hwnd: {self.hwnd})")
-            else:
-                logger.warning("No active window found to capture")
-                self.hwnd = None
+            tokens = self._read_tokens(path)
         except Exception as e:
-            logger.error(f"Error capturing active window: {e}")
-            self.hwnd = None
+            self.notify(f"Failed to load file: {e}", "negative")
+            return
+        self._stop_playback(quiet=True)
+        with self._lock:
+            self.file_path = path
+        self.publish("UI", {"event": "progress", "done": 0, "total": len(tokens)})
+        logger.info(f"Loaded {path}: {len(tokens)} tokens")
 
-    def type_text_tokens(self):
-        """Type all loaded text tokens."""
-        self.play_in_session = True
-        self.focus_window()
-        if self.start_playback_paused:
-            self.paused = True
-            self._update_play_status("paused")
-
-        for token in self.text_tokens:
-            token_completed = False
-            while not token_completed and self.play is True:
-                if (
-                    (self.play and not self.paused) or
-                    (self.play and self.paused and self.advance_to_newline > 0) or
-                    (self.play and self.paused and self.advance_token > 0)
-                ):
-                    if (
-                        (self.play and self.resumed > 0) or
-                        (not self.paused and self.check_window_focused(pause_if_not=True)) or
-                        (self.play and self.paused and self.advance_to_newline > 0) or
-                        (self.play and self.paused and self.advance_token > 0)
-                        
-                    ):
-                        self.focus_window()
-                        if self.resumed:
-                            self.resumed = 0
-                        token_completed = self.type_token(token)
-                        if token_completed and self.advance_token > 0:
-                            self.advance_token -= 1
-                if not self.play:
-                    break
-                if self.paused:
-                    time.sleep(0.1)
-            if not self.play:
-                break
-            if token_completed:
-                # Update preview (remove first token)
-                if self.text_tokens_preview:
-                    self.text_tokens_preview.pop(0)
-
-        # Playback finished
-        self.play = False
-        self.paused = False
-        self.play_in_session = False
-
-        # Update play_status state to stopped
-        self._update_play_status("stopped")
-        logger.info("Playback finished")
-
-    def check_window_focused(self, pause_if_not=False):
-        """Check if target window is focused.
-
-        When window focus changes and auto-pause is enabled, updates both
-        local state and publishes the change to the STATE process.
-        """
-        if not self.hwnd or not self.pause_on_window_not_focused:
-            return True
-
-        active_window = gw.getActiveWindow()
-        if not active_window or active_window._hWnd != self.hwnd:
-            if pause_if_not and not self.paused and not self.play_status == "stopped":
-                # Update local state first
-                self.paused = True
-
-                # Publish play_status update to STATE process
-                self._update_play_status("paused")
-                logger.info("Window focus lost - paused playback and updated STATE")
-            return False
+    def _set_status(self, status: str, session: Optional[int] = None) -> bool:
+        """Change status and report it. If session is given, only apply while it is current."""
+        with self._lock:
+            if session is not None and session != self._session:
+                return False
+            changed = self.status != status
+            self.status = status
+            if status != "paused":
+                self._advance_newline = False
+                self._advance_tokens = 0
+            self._wake.notify_all()
+        if changed:
+            self.publish("STATE", {"cmd": "update_state", "key": "play_status", "value": status})
+            logger.info(f"Playback status -> {status}")
         return True
 
-    def focus_window(self):
-        """Focus the target window."""
-        if self.hwnd:
-            try:
-                windows = [w for w in gw.getAllWindows() if w._hWnd == self.hwnd]
-                if windows:
-                    windows[0].activate()
-            except Exception as e:
-                logger.debug(f"Error focusing window: {e}")
+    def _play(self) -> None:
+        with self._lock:
+            if self.status == "paused":
+                self._resume()
+                return
+            if self.status == "playing":
+                return
+            if not self.file_path:
+                self.notify("No source file is loaded", "warning")
+                self.publish("STATE", {"cmd": "update_state", "key": "play_status", "value": "stopped"})
+                return
+            self._session += 1
+            session = self._session
+            self._advance_newline = False
+            self._advance_tokens = 0
+        self._set_status("playing")
+        threading.Thread(target=self._run_session, args=(session,), name=f"playback-{session}", daemon=True).start()
 
-    def publish(self, topic: str, data: Dict[str, Any]):
-        """Emit a message via MQTT."""
-        if self._mqtt_connected:
-            message = json.dumps(data)
-            self._mqtt_client.publish(topic, message, qos=1)
+    def _pause(self) -> None:
+        with self._lock:
+            if self.status == "playing":
+                self._set_status("paused")
 
-    def _update_play_status(self, status: str):
-        """Update the play_status state."""
-        state_msg = {"cmd": "update_state", "key": "play_status", "value": status}
-        self.publish("STATE", state_msg)
-        logger.debug(f"Updated play_status to '{status}'")
+    def _resume(self) -> None:
+        with self._lock:
+            if self.status != "paused":
+                return
+            self._refocus_pending = bool(self.settings["refocus_window_on_resume"])
+            self._set_status("playing")
 
-    def _reset_to_beginning(self):
-        """Reset tokens to beginning of file."""
-        if self.original_text_tokens:
-            self.text_tokens = self.original_text_tokens.copy()
-            self.text_tokens_preview = ['[ ' + str(x) + ' ]' for x in self.original_text_tokens]
-            logger.info("Reset to beginning of file")
-        else:
-            logger.warning("No original tokens to reset to")
+    def _stop_playback(self, quiet: bool = False) -> None:
+        with self._lock:
+            was_running = self.status != "stopped"
+            self._session += 1  # invalidates any running playback thread
+            self._set_status("stopped")
+        if was_running and not quiet:
+            self.notify("Playback stopped")
 
-    def start(self):
-        """Start the Typer and connect to MQTT."""
-        if self._running:
-            logger.info("Typer already running")
-            return
+    def _advance(self, newline: bool) -> None:
+        with self._lock:
+            if self.status == "stopped":
+                self.notify("Playback has not started", "warning")
+                return
+            if newline:
+                # While playing this means "pause at the end of the current line".
+                self._advance_newline = True
+            elif self.status == "paused":
+                self._advance_tokens += 1
+            self._wake.notify_all()
 
-        self._running = True
+    # -------------------------------------------------------------- playback
 
-        # Connect to MQTT broker
+    def _check(self, session: int) -> None:
+        if session != self._session:
+            raise Cancelled()
+
+    def _sleep(self, session: int, seconds: float) -> None:
+        """Interruptible sleep."""
+        end = time.monotonic() + seconds
+        while True:
+            self._check(session)
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, 0.05))
+
+    def _gate(self, session: int) -> None:
+        """Block until the next keystroke may be sent to the target window."""
+        warned_focus = False
+        while True:
+            with self._lock:
+                self._check(session)
+                paused = self.status == "paused"
+                advancing = self._advance_newline or self._advance_tokens > 0
+                refocus = self._refocus_pending
+                self._refocus_pending = False
+                if paused and not advancing:
+                    self._wake.wait(0.1)
+                    continue
+                pause_on_blur = bool(self.settings["pause_on_window_not_focused"])
+
+            if not winutil.is_window(self.hwnd):
+                self.notify("Target window was closed; playback stopped", "warning")
+                self._stop_playback(quiet=True)
+                raise Cancelled()
+
+            if winutil.get_foreground_window() == self.hwnd:
+                return
+
+            # Target is not focused.
+            if refocus or paused or not pause_on_blur:
+                # Resuming / stepping / focus-pausing disabled: bring the target back.
+                if winutil.focus_window(self.hwnd):
+                    time.sleep(0.15)  # let the window settle before typing
+                    continue
+                if not warned_focus:
+                    self.notify("Could not focus the target window; click into it to continue", "warning")
+                    warned_focus = True
+                if paused:
+                    with self._lock:
+                        self._advance_newline = False
+                        self._advance_tokens = 0
+                time.sleep(0.2)
+                continue
+
+            if self._set_status("paused", session):
+                self.notify("Paused: target window lost focus", "warning")
+
+    def _tap(self, key, hold: float = 0.02) -> None:
+        self.kb.press(key)
         try:
-            self._mqtt_client.connect(self._mqtt_host, self._mqtt_port, keepalive=60)
-            self._mqtt_client.loop_start()
-            logger.info(f"Typer connecting to MQTT broker on port {self._mqtt_port}")
+            time.sleep(hold)
+        finally:
+            self.kb.release(key)
+
+    def _type_char(self, session: int, char: str) -> None:
+        self._gate(session)
+        key = Key.tab if char == "\t" else char
+        speed = self._speed_ms() / 1000
+        self._tap(key, hold=min(speed / 3, 0.03))
+        self._sleep(session, speed * 2 / 3)
+
+    def _press_named(self, session: int, name: str, count: int = 1) -> None:
+        key = getattr(Key, name)
+        for _ in range(count):
+            self._gate(session)
+            speed = self._speed_ms() / 1000
+            self._tap(key, hold=min(speed / 3, 0.03))
+            self._sleep(session, speed * 2 / 3)
+
+    def _combo(self, session: int, keys: tuple[str, ...]) -> None:
+        self._gate(session)
+        resolved = [getattr(Key, k) if len(k) > 1 else k for k in keys]
+        pressed = []
+        try:
+            for k in resolved:
+                self.kb.press(k)
+                pressed.append(k)
+            time.sleep(0.03)
+        finally:
+            for k in reversed(pressed):
+                self.kb.release(k)
+        self._sleep(session, self._speed_ms() / 1000)
+
+    def _newline(self, session: int) -> None:
+        self._gate(session)
+        speed = self._speed_ms() / 1000
+        if self.settings["control_on_newline"]:
+            self._combo(session, ("ctrl", "enter"))
+        else:
+            self._tap(Key.enter)
+            self._sleep(session, speed)
+        if self.settings["auto_home_on_newline"]:
+            self._tap(Key.home)
+            self._sleep(session, speed / 2)
+        with self._lock:
+            self._check(session)
+            if self._advance_newline:
+                self._advance_newline = False
+                self._set_status("paused")
+            elif self.settings["pause_on_new_line"] and self.status == "playing":
+                self._set_status("paused")
+
+    def _execute(self, session: int, token: Token) -> None:
+        if isinstance(token, Text):
+            for char in token.text:
+                self._type_char(session, char)
+        elif isinstance(token, Newline):
+            self._newline(session)
+        elif isinstance(token, KeyPress):
+            self._press_named(session, token.key, token.count)
+        elif isinstance(token, KeyCombo):
+            self._combo(session, token.keys)
+        elif isinstance(token, MouseScroll):
+            for _ in range(token.count):
+                self._gate(session)
+                self.ms.scroll(0, token.direction)
+                self._sleep(session, max(0.05, self._speed_ms() / 2000))
+        elif isinstance(token, TimedPause):
+            self._gate(session)
+            self._sleep(session, token.seconds)
+        elif isinstance(token, PausePoint):
+            with self._lock:
+                self._check(session)
+                self._advance_newline = False
+                self._advance_tokens = 0
+                self._set_status("paused")
+            self.notify("Paused at <<PAUSE>> marker")
+
+    def _report_progress(self, done: int, total: int, force: bool = False) -> None:
+        now = time.monotonic()
+        if force or now - self._last_progress >= PROGRESS_INTERVAL:
+            self._last_progress = now
+            self.publish("UI", {"event": "progress", "done": done, "total": total})
+
+    def _countdown(self, session: int) -> None:
+        delay = max(0, int(self.settings.get("start_delay", 5)))
+        for remaining in range(delay, 0, -1):
+            self.publish("UI", {"event": "countdown", "remaining": remaining})
+            self._sleep(session, 1)
+        self.publish("UI", {"event": "countdown", "remaining": 0})
+
+    def _capture_target(self) -> bool:
+        hwnd = winutil.get_foreground_window()
+        title = winutil.get_window_title(hwnd)
+        if not hwnd or title == APP_TITLE:
+            self.notify("No target window: click into your editor before playback starts", "warning")
+            return False
+        self.hwnd = hwnd
+        logger.info(f"Target window: '{title}' (hwnd {hwnd})")
+        self.publish("UI", {"event": "target", "title": title})
+        return True
+
+    def _run_session(self, session: int) -> None:
+        try:
+            tokens = self._read_tokens(self.file_path)
         except Exception as e:
-            logger.error(f"Failed to connect to MQTT broker: {e}")
-            self._running = False
+            self.notify(f"Failed to read file: {e}", "negative")
+            self._set_status("stopped", session)
             return
 
-    def stop(self):
-        """Stop the Typer."""
-        if not self._running:
-            return
+        total = len(tokens)
+        try:
+            self._report_progress(0, total, force=True)
+            self._countdown(session)
+            self._check(session)
+            if not self._capture_target():
+                self._set_status("stopped", session)
+                return
+            if self.settings["start_playback_paused"]:
+                self._set_status("paused", session)
 
-        self._running = False
-        self.play = False
+            for index, token in enumerate(tokens):
+                self._execute(session, token)
+                with self._lock:
+                    self._check(session)
+                    if self.status == "paused" and self._advance_tokens > 0:
+                        self._advance_tokens -= 1
+                logger.debug(f"Typed token {index + 1}/{total}: {describe(token)}")
+                self._report_progress(index + 1, total)
 
-        # Stop MQTT client
-        if self._mqtt_client:
-            self._mqtt_client.loop_stop()
-            self._mqtt_client.disconnect()
+            self._report_progress(total, total, force=True)
+            if self._set_status("stopped", session):
+                self.notify("Playback finished", "positive")
+        except Cancelled:
+            logger.info(f"Playback session {session} cancelled")
+        except Exception as e:
+            logger.exception("Playback error")
+            self.notify(f"Playback error: {e}", "negative")
+            self._set_status("stopped", session)
 
-        logger.info("Typer stopped")
+    # ------------------------------------------------------------- lifecycle
 
-    def is_running(self) -> bool:
-        """Check if Typer is running."""
-        return self._running
+    def start(self) -> bool:
+        try:
+            self._client.connect(self._mqtt_host, self._mqtt_port, keepalive=60)
+        except Exception as e:
+            logger.error(f"Typer failed to connect to MQTT broker: {e}")
+            return False
+        self._client.loop_start()
+        self._running.set()
+        return True
+
+    def stop(self) -> None:
+        with self._lock:
+            self._session += 1
+            self._wake.notify_all()
+        if self._running.is_set():
+            self._running.clear()
+            self._client.loop_stop()
+            self._client.disconnect()
+            logger.info("Typer stopped")
+
+    def wait(self) -> None:
+        while self._running.is_set():
+            time.sleep(0.5)
 
 
-def typer_process(host:str, port: int, enable_logging: bool = True):
-    """Run the typer as a separate process."""
-    if enable_logging:
-        logger.configure(
-            handlers=[
-                {
-                    "sink": "ghost_coder.log",
-                    "format": "[{time:YYYY-MM-DD HH:mm:ss}] {level} {name}:{function}:{line} - {message}",
-                    "rotation": "10 MB",
-                    "retention": "7 days",
-                    "level": "DEBUG"
-                },
-                {
-                    "sink": lambda msg: print(msg, end=""),
-                    "format": "[{time:YYYY-MM-DD HH:mm:ss}] {level} {name}:{function}:{line} - {message}",
-                    "level": "DEBUG"
-                }
-            ]
-        )
-        logger.enable("ghost_coder")
-    else:
-        logger.disable("ghost_coder")
-
+def typer_process(host: str, port: int, enable_logging: bool = False) -> None:
+    """Entry point for the typer child process."""
+    setup_logging(enable_logging)
     logger.info("Starting Typer process")
-    typer = Typer(mqtt_host = host, mqtt_port=port)
-    typer.start()
-
+    typer = Typer(mqtt_host=host, mqtt_port=port)
+    if not typer.start():
+        return
+    start_parent_watchdog(typer.stop)
     try:
-        # Keep the process running
-        while typer.is_running():
-            time.sleep(1)
+        typer.wait()
     except KeyboardInterrupt:
-        logger.info("Typer interrupted")
+        pass
     finally:
         typer.stop()
-        logger.info("Typer stopped")
-

@@ -1,974 +1,736 @@
+"""Ghost Coder UI process: NiceGUI native window that controls the typer and listener processes."""
+
+import argparse
 import json
 import multiprocessing as mp
-import argparse
-import time
 import os
-import sys
+import shutil
 import subprocess
+import sys
 from pathlib import Path
+from queue import Empty, Queue
+from typing import Any, Optional
+
+import paho.mqtt.client as mqtt
 from loguru import logger
-from nicegui import ui, app
-from queue import Queue
-import paho.mqtt.client as Client
-from ghost_coder.utils import get_random_available_port
+from nicegui import app, ui
+
+from ghost_coder import APP_TITLE, __version__
 from ghost_coder.broker import broker_process
 from ghost_coder.listener import listener_process
-from ghost_coder.typer import typer_process
-from ghost_coder import __version__ as APP_VERSION
+from ghost_coder.typer import DEFAULT_SETTINGS, typer_process
+from ghost_coder.utils import (
+    config_dir, get_random_available_port, log_file, read_json, rotate_log_if_large, setup_logging,
+    unique_client_id, wait_for_port, write_json,
+)
 
-# Path to hotkeys configuration file
-HOTKEYS_FILE = Path(__file__).parent / "hotkeys.json"
+ICON_FILE = Path(__file__).parent / "assets" / "icon.ico"
+LEGACY_HOTKEYS_FILE = Path(__file__).parent / "hotkeys.json"
 
-UI_ELEMENTS = {
-    'source_file_path_field': None,
-    'select_source_file_button': None,
-    'open_folder_button': None,
-    'open_in_editor_button': None,
-    'play_button': None,
-    'stop_button': None,
-    'advance_to_next_newline_button': None,
-    'advance_to_next_token_button': None,
-    'typing_speed_value': 50,
-    'typing_speed_label': None,
-    'pause_on_new_line_chkbx': None,
-    'start_playback_paused': None,
-    'auto_home_on_newline': None,
-    'control_on_newline': None,
-    'replace_quad_spaces_with_tab': None,
-    'pause_on_window_not_focused': None,
-    'refocus_window_on_resume': None,
-    'source_code_display': None,
-    'hotkey_labels': {
-        1: None,  # play_button label
-        2: None,  # stop_button label
-        3: None,  # advance_to_next_newline_button label
-        4: None   # advance_to_next_token_button label
-    }
+SLOT_NAMES = {1: "Play / Pause / Resume", 2: "Stop", 3: "Advance to Newline", 4: "Advance Token"}
+
+LANGUAGES = {
+    ".py": "python", ".pyw": "python", ".js": "javascript", ".mjs": "javascript", ".ts": "typescript",
+    ".tsx": "tsx", ".jsx": "jsx", ".java": "java", ".c": "c", ".h": "c", ".cpp": "cpp", ".cc": "cpp",
+    ".hpp": "cpp", ".cs": "csharp", ".go": "go", ".rs": "rust", ".rb": "ruby", ".php": "php",
+    ".html": "html", ".htm": "html", ".css": "css", ".scss": "scss", ".json": "json", ".yaml": "yaml",
+    ".yml": "yaml", ".toml": "toml", ".md": "markdown", ".sh": "bash", ".ps1": "powershell",
+    ".sql": "sql", ".kt": "kotlin", ".swift": "swift", ".lua": "lua", ".bat": "batch",
 }
 
-APP_STATE = {
-    'play_status': 'stopped', # playing, paused, stopped
-    'typing_speed_value': 50, # 50 - 500
-    'pause_on_new_line': False,
-    'start_playback_paused': False,
-    'auto_home_on_newline': True,
-    'control_on_newline': True,
-    'replace_quad_spaces_with_tab': True,
-    'pause_on_window_not_focused': True,
-    'refocus_window_on_resume': True,
-    'varied_coding_speed': False,
-    'source_file_path': '',
-    'loaded_file_data': '',
-    'loaded_file_parsed_data': '',
-    'hotkeys': {
-        1: None,  # play_button
-        2: None,  # stop_button
-        3: None,  # advance_to_next_newline_button
-        4: None   # advance_to_next_token_button
-    }
+SETTINGS: dict[str, Any] = {**DEFAULT_SETTINGS, "dark_mode": False, "last_file": ""}
+
+STATE: dict[str, Any] = {
+    "play_status": "stopped",  # mirrored from the typer
+    "source_file_path": "",
+    "hotkeys": {slot: None for slot in SLOT_NAMES},
+    "inactive_hotkeys": set(),  # saved hotkeys whose device is currently unavailable
+    "progress": (0, 0),
+    "countdown": 0,
+    "target_title": "",
 }
 
-# MQTT setup
-mqtt_queue = Queue()
-mqtt_client = None
+UI: dict[str, Any] = {}
 
-def setup_mqtt_client(host, port):
-    """Initialize and connect the MQTT client."""
+mqtt_queue: "Queue[tuple[str, dict]]" = Queue()
+mqtt_client: Optional[mqtt.Client] = None
+CHILD_PROCESSES: dict[str, mp.Process] = {}
+DEAD_PROCESSES_REPORTED: set[str] = set()
+SHUTTING_DOWN = False
+
+
+# ---------------------------------------------------------------- persistence
+
+def settings_file() -> Path:
+    return config_dir() / "settings.json"
+
+
+def hotkeys_file() -> Path:
+    return config_dir() / "hotkeys.json"
+
+
+def load_settings() -> None:
+    saved = read_json(settings_file(), {})
+    if isinstance(saved, dict):
+        for key, value in saved.items():
+            if key in SETTINGS and value is not None:
+                SETTINGS[key] = value
+
+
+def save_settings() -> None:
+    try:
+        write_json(settings_file(), SETTINGS)
+    except OSError as e:
+        logger.error(f"Could not save settings: {e}")
+
+
+def load_hotkeys() -> None:
+    path = hotkeys_file()
+    if not path.exists() and LEGACY_HOTKEYS_FILE.exists():
+        # Earlier versions stored hotkeys inside the package directory.
+        try:
+            shutil.copyfile(LEGACY_HOTKEYS_FILE, path)
+        except OSError:
+            path = LEGACY_HOTKEYS_FILE
+    saved = read_json(path, {})
+    if not isinstance(saved, dict):
+        return
+    for slot_str, hotkey in saved.items():
+        try:
+            slot = int(slot_str)
+        except ValueError:
+            continue
+        if slot in STATE["hotkeys"] and isinstance(hotkey, dict):
+            STATE["hotkeys"][slot] = hotkey
+
+
+def save_hotkeys() -> None:
+    try:
+        write_json(hotkeys_file(), {str(s): hk for s, hk in STATE["hotkeys"].items() if hk})
+    except OSError as e:
+        logger.error(f"Could not save hotkeys: {e}")
+
+
+# ----------------------------------------------------------------------- MQTT
+
+def setup_mqtt_client(host: str, port: int) -> None:
     global mqtt_client
-
-    mqtt_client = Client.Client(Client.CallbackAPIVersion.VERSION2, "ui_client")
-    mqtt_client.user_data_set({"host": host, "port": port})
+    mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, unique_client_id("ui"))
     mqtt_client.on_connect = on_mqtt_connect
     mqtt_client.on_message = on_mqtt_message
-
+    mqtt_client.reconnect_delay_set(min_delay=1, max_delay=5)
     try:
         mqtt_client.connect(host, port, keepalive=60)
-        mqtt_client.loop_start()
-        logger.info(f"UI MQTT client connecting to {host}:{port}")
     except Exception as e:
-        logger.error(f"Failed to connect UI MQTT client: {e}")
+        logger.error(f"UI failed to connect to MQTT broker at {host}:{port}: {e}")
+    mqtt_client.loop_start()
 
-def on_mqtt_connect(client, userdata, flags, rc, properties=None):
-    """Callback when MQTT client connects to broker."""
-    if rc == 0:
-        logger.info(f"UI connected to MQTT broker at {userdata['host']}:{userdata['port']}")
-        client.subscribe([("UI", 1), ("APP", 1), ("STATE", 1), ("LISTENER", 1)])
-        logger.info("UI subscribed to topics: UI, APP, STATE, LISTENER")
-    else:
-        logger.error(f"UI failed to connect to MQTT broker, return code: {rc}")
+
+def on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
+    if reason_code.is_failure:
+        logger.error(f"UI failed to connect to MQTT broker: {reason_code}")
+        return
+    client.subscribe([("UI", 1), ("APP", 1), ("STATE", 1), ("LISTENER", 1)])
+    logger.info("UI connected to MQTT broker")
+    mqtt_queue.put(("_internal", {"event": "connected"}))
+
 
 def on_mqtt_message(client, userdata, message):
-    """Callback when MQTT message is received."""
-    mqtt_queue.put((message.topic, message.payload.decode()))
-    logger.debug(f"UI received message - Topic: {message.topic}, Payload: {message.payload.decode()}")
-
-def save_hotkeys():
-    """Save current hotkeys to hotkeys.json file."""
     try:
-        # Filter out None values before saving
-        hotkeys_to_save = {
-            str(slot): hotkey_data
-            for slot, hotkey_data in APP_STATE['hotkeys'].items()
-            if hotkey_data is not None
-        }
+        data = json.loads(message.payload.decode())
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        logger.warning(f"UI ignoring non-JSON message on {message.topic}")
+        return
+    if isinstance(data, dict):
+        mqtt_queue.put((message.topic, data))
 
-        with open(HOTKEYS_FILE, 'w') as f:
-            json.dump(hotkeys_to_save, f, indent=2)
 
-        logger.info(f"Hotkeys saved to {HOTKEYS_FILE}")
-    except Exception as e:
-        logger.error(f"Error saving hotkeys: {e}")
+def publish(topic: str, data: dict[str, Any]) -> bool:
+    if mqtt_client and mqtt_client.is_connected():
+        mqtt_client.publish(topic, json.dumps(data), qos=1)
+        return True
+    logger.warning(f"MQTT not connected; dropped message to {topic}: {data}")
+    return False
 
-def load_hotkeys():
-    """Load hotkeys from hotkeys.json file."""
-    try:
-        if HOTKEYS_FILE.exists():
-            with open(HOTKEYS_FILE, 'r') as f:
-                saved_hotkeys = json.load(f)
 
-            # Convert string keys back to integers and update APP_STATE
-            for slot_str, hotkey_data in saved_hotkeys.items():
-                slot = int(slot_str)
-                if slot in APP_STATE['hotkeys']:
-                    APP_STATE['hotkeys'][slot] = hotkey_data
+def send_typer(cmd: str, **kwargs) -> bool:
+    return publish("TYPER", {"cmd": cmd, **kwargs})
 
-            logger.info(f"Hotkeys loaded from {HOTKEYS_FILE}: {saved_hotkeys}")
-            return True
-        else:
-            logger.info(f"No hotkeys file found at {HOTKEYS_FILE}")
-            return False
-    except Exception as e:
-        logger.error(f"Error loading hotkeys: {e}")
+
+def publish_settings() -> None:
+    publish("STATE", {"state-data": {k: SETTINGS[k] for k in DEFAULT_SETTINGS}})
+
+
+def send_hotkeys_to_listener() -> None:
+    for slot, hotkey in STATE["hotkeys"].items():
+        if hotkey:
+            publish("LISTENER", {"cmd": "restore", "slot": slot, "source": hotkey.get("source"),
+                                 "value": hotkey.get("value"), "gamepad_name": hotkey.get("gamepad_name")})
+
+
+# ------------------------------------------------------------- message pump
+
+def check_mqtt_messages() -> None:
+    while True:
+        try:
+            topic, data = mqtt_queue.get_nowait()
+        except Empty:
+            return
+        try:
+            handle_message(topic, data)
+        except Exception:
+            logger.exception(f"Error handling {topic} message: {data}")
+
+
+def handle_message(topic: str, data: dict[str, Any]) -> None:
+    global SHUTTING_DOWN
+    if topic == "_internal":
+        if data.get("event") == "connected":
+            publish_settings()
+            send_hotkeys_to_listener()
+            if STATE["source_file_path"]:
+                send_typer("load_file", file=STATE["source_file_path"])
+
+    elif topic == "APP":
+        if "CLOSE" in (data.get("cmd"), data.get("command")) and not SHUTTING_DOWN:
+            logger.info("UI received CLOSE")
+            SHUTTING_DOWN = True
+            # Close the native window; NiceGUI then shuts the server down cleanly.
+            app.native.main_window.destroy()
+
+    elif topic == "UI":
+        event = data.get("event")
+        if "notify" in data:
+            ui.notify(str(data["notify"]), type=data.get("type", "info"))
+        elif event == "typer_ready":
+            publish_settings()
+            if STATE["source_file_path"]:
+                send_typer("load_file", file=STATE["source_file_path"])
+        elif event == "progress":
+            STATE["progress"] = (int(data.get("done", 0)), int(data.get("total", 0)))
+            update_status()
+        elif event == "countdown":
+            STATE["countdown"] = int(data.get("remaining", 0))
+            update_status()
+        elif event == "target":
+            STATE["target_title"] = str(data.get("title", ""))
+            update_status()
+
+    elif topic == "STATE":
+        if data.get("cmd") == "update_state" and data.get("key") == "play_status":
+            STATE["play_status"] = data.get("value", "stopped")
+            if STATE["play_status"] != "playing":
+                STATE["countdown"] = 0
+            update_status()
+
+    elif topic == "LISTENER":
+        handle_listener_event(data)
+
+
+def handle_listener_event(data: dict[str, Any]) -> None:
+    event = data.get("event")
+    slot = data.get("slot")
+
+    if event == "listener_ready":
+        send_hotkeys_to_listener()
+    elif event == "hotkey_triggered":
+        handle_hotkey_trigger(slot)
+    elif event == "hotkey_registered" and slot in STATE["hotkeys"]:
+        source, value = data.get("source"), data.get("value")
+        for other, hotkey in STATE["hotkeys"].items():
+            if other != slot and hotkey and hotkey.get("source") == source and hotkey.get("value") == value:
+                STATE["hotkeys"][other] = None
+                ui.notify(f"Hotkey moved from '{SLOT_NAMES[other]}' to '{SLOT_NAMES[slot]}'")
+        hotkey = {"source": source, "value": value}
+        if data.get("gamepad_name"):
+            hotkey["gamepad_name"] = data["gamepad_name"]
+        STATE["hotkeys"][slot] = hotkey
+        STATE["inactive_hotkeys"].discard(slot)
+        save_hotkeys()
+        close_recording_dialog()
+        update_hotkey_labels()
+        ui.notify(f"Hotkey set: {SLOT_NAMES[slot]} = {source} {value}", type="positive")
+    elif event == "hotkey_registration_error":
+        ui.notify(f"Hotkey not set: {data.get('error')}", type="negative")
+        if "No gamepad" in str(data.get("error")):
+            close_recording_dialog()
+    elif event == "hotkey_registration_cancelled":
+        close_recording_dialog()
+        ui.notify(f"Hotkey registration {data.get('reason', 'cancelled')}")
+    elif event == "hotkey_restoration_success" and slot in STATE["hotkeys"]:
+        STATE["inactive_hotkeys"].discard(slot)
+        update_hotkey_labels()
+    elif event == "hotkey_restoration_error" and slot in STATE["hotkeys"]:
+        # Keep the saved hotkey (e.g. gamepad unplugged) but show it as inactive.
+        STATE["inactive_hotkeys"].add(slot)
+        update_hotkey_labels()
+        ui.notify(f"Hotkey '{SLOT_NAMES[slot]}' inactive: {data.get('error')}", type="warning")
+
+
+# ----------------------------------------------------------------- playback
+
+def require_file() -> bool:
+    if not STATE["source_file_path"]:
+        ui.notify("No source file is loaded", type="warning")
         return False
+    return True
 
-def send_hotkeys_to_listener():
-    """Send loaded hotkeys to the listener process to re-register them."""
-    if not mqtt_client or not mqtt_client.is_connected():
-        logger.warning("Cannot send hotkeys to listener - MQTT not connected")
+
+def toggle_playback() -> None:
+    status = STATE["play_status"]
+    if status == "playing":
+        if send_typer("pause"):
+            STATE["play_status"] = "paused"
+    elif status == "paused":
+        if send_typer("resume"):
+            STATE["play_status"] = "playing"
+    else:
+        if not require_file():
+            return
+        refresh_preview()
+        publish_settings()
+        if send_typer("play"):
+            STATE["play_status"] = "playing"
+            delay = int(SETTINGS["start_delay"])
+            if delay:
+                ui.notify(f"Starting in {delay}s: click into the window you want to type into")
+    update_status()
+
+
+def stop_playback() -> None:
+    if STATE["play_status"] == "stopped":
+        ui.notify("Nothing is playing", type="warning")
         return
-
-    hotkeys_to_restore = 0
-
-    for slot, hotkey_data in APP_STATE['hotkeys'].items():
-        if hotkey_data:
-            # Send a restore request to the listener
-            # The listener will validate device availability and respond with success/error
-            restore_msg = json.dumps({
-                "event": "hotkey_registered",
-                "slot": slot,
-                "source": hotkey_data.get('source'),
-                "value": hotkey_data.get('value'),
-                "gamepad_name": hotkey_data.get('gamepad_name'),
-                "restore": True  # Flag to indicate this is a restore operation
-            })
-            mqtt_client.publish("LISTENER", restore_msg, qos=1)
-            hotkeys_to_restore += 1
-            logger.info(f"Requesting restoration of hotkey - Slot {slot}: {hotkey_data}")
-
-    if hotkeys_to_restore > 0:
-        logger.info(f"Requested restoration of {hotkeys_to_restore} saved hotkey(s)")
-        ui.notify(f"Restoring {hotkeys_to_restore} saved hotkey(s)...")
-
-def check_mqtt_messages():
-    """Process MQTT messages from the queue."""
-    while not mqtt_queue.empty():
-        topic, payload = mqtt_queue.get()
-
-        # Parse JSON payload
-        try:
-            data = json.loads(payload)
-        except json.JSONDecodeError:
-            logger.warning(f"Received non-JSON message on {topic}: {payload}")
-            continue
-
-        # Handle APP topic messages
-        if topic == "APP":
-            if data.get("cmd") == "CLOSE":
-                logger.info("UI received CLOSE command, shutting down")
-                app.shutdown()
-
-        # Handle UI topic messages
-        elif topic == "UI":
-            if data.get("notify"):
-                msg = data.get("notify")
-                logger.info(f"UI message: {msg}")
-                ui.notify(f"{msg}")
-
-        # Handle STATE topic messages
-        elif topic == "STATE":
-            if data.get("cmd") == "update_state":
-                key = data.get("key")
-                value = data.get("value")
-                logger.info(f"STATE update message: {key} : {value}")
-                if key in APP_STATE.keys():
-                    APP_STATE[key] = value
-                    state_changed()
-
-        # Handle LISTENER topic messages
-        elif topic == "LISTENER":
-            event = data.get("event")
-            if event == "hotkey_triggered":
-                slot = data.get("slot")
-                logger.info(f"Hotkey {slot} triggered")
-                handle_hotkey_trigger(slot)
-            elif event == "hotkey_restoration_success":
-                # Handle successful hotkey restoration
-                slot = data.get("slot")
-                source = data.get("source")
-                value = data.get("value")
-                logger.info(f"Hotkey restored successfully for slot {slot}: {source} - {value}")
-                # UI already has the hotkey in APP_STATE from loading, just update labels
-                update_hotkey_labels()
-            elif event == "hotkey_restoration_error":
-                # Handle hotkey restoration error (device not available)
-                slot = data.get("slot")
-                source = data.get("source")
-                error = data.get("error")
-                logger.warning(f"Hotkey restoration failed for slot {slot}: {error}")
-                # Clear the failed hotkey from APP_STATE
-                if slot in APP_STATE['hotkeys']:
-                    APP_STATE['hotkeys'][slot] = None
-                    update_hotkey_labels()
-                    save_hotkeys()  # Save updated state without the failed hotkey
-                ui.notify(f"Hotkey {slot} not restored: {error}", type='warning')
-            elif event == "hotkey_registered":
-                # Handle hotkey registration confirmation
-                slot = data.get("slot")
-                source = data.get("source")
-                value = data.get("value")
-                gamepad_name = data.get("gamepad_name")
-
-                if slot and source and value:
-                    # Check if this hotkey is already assigned to another slot
-                    for existing_slot, existing_hotkey in APP_STATE['hotkeys'].items():
-                        if existing_slot != slot and existing_hotkey:
-                            # Check if it's the same hotkey (same source, value, and gamepad if applicable)
-                            if (existing_hotkey.get('source') == source and
-                                existing_hotkey.get('value') == value):
-                                # For gamepad hotkeys, also check gamepad_name
-                                if source == 'gamepad':
-                                    existing_gamepad = existing_hotkey.get('gamepad_name')
-                                    if existing_gamepad == gamepad_name:
-                                        # Same gamepad hotkey, clear the old assignment
-                                        logger.info(f"Hotkey already assigned to slot {existing_slot}, clearing old assignment")
-                                        APP_STATE['hotkeys'][existing_slot] = None
-                                        # Send unregister command to listener for the old slot
-                                        if mqtt_client and mqtt_client.is_connected():
-                                            unregister_msg = json.dumps({
-                                                "cmd": "unregister",
-                                                "slot": existing_slot
-                                            })
-                                            mqtt_client.publish("LISTENER", unregister_msg, qos=1)
-                                        ui.notify(f"Hotkey moved from slot {existing_slot} to slot {slot}", type='info')
-                                        break
-                                else:
-                                    # Non-gamepad hotkey (keyboard/mouse), clear the old assignment
-                                    logger.info(f"Hotkey already assigned to slot {existing_slot}, clearing old assignment")
-                                    APP_STATE['hotkeys'][existing_slot] = None
-                                    # Send unregister command to listener for the old slot
-                                    if mqtt_client and mqtt_client.is_connected():
-                                        unregister_msg = json.dumps({
-                                            "cmd": "unregister",
-                                            "slot": existing_slot
-                                        })
-                                        mqtt_client.publish("LISTENER", unregister_msg, qos=1)
-                                    ui.notify(f"Hotkey moved from slot {existing_slot} to slot {slot}", type='info')
-                                    break
-
-                    # Assign the new hotkey
-                    APP_STATE['hotkeys'][slot] = {
-                        'source': source,
-                        'value': value
-                    }
-                    if gamepad_name:
-                        APP_STATE['hotkeys'][slot]['gamepad_name'] = gamepad_name
-                    update_hotkey_labels()
-                    save_hotkeys()  # Auto-save when hotkey is registered
-                    logger.info(f"Hotkey registered for slot {slot}: {source} - {value}")
-                    ui.notify(f"Hotkey registered: {source.capitalize()} - {value}")
-            elif event == "hotkey_registration_error":
-                # Handle hotkey registration error
-                slot = data.get("slot")
-                source = data.get("source")
-                error = data.get("error")
-                logger.warning(f"Hotkey registration failed for slot {slot}: {error}")
-                ui.notify(f"Hotkey registration failed: {error}", type='negative')
-            elif event == "hotkey_registration_cancelled":
-                # Handle hotkey registration cancellation
-                slot = data.get("slot")
-                source = data.get("source")
-                logger.info(f"Hotkey registration cancelled for slot {slot}")
-                ui.notify("Hotkey registration cancelled", type='info')
-            elif "info" not in data:  # Not a help message
-                # Hotkey registration confirmation (no explicit event) - legacy support
-                # Update local state when we receive slot/source/value
-                slot = data.get("slot")
-                source = data.get("source")
-                value = data.get("value")
-                if slot and source and value:
-                    APP_STATE['hotkeys'][slot] = {
-                        'source': source,
-                        'value': value
-                    }
-                    update_hotkey_labels()
-                    logger.info(f"Updated hotkey {slot}: {source} - {value}")
+    if send_typer("stop"):
+        STATE["play_status"] = "stopped"
+        update_status()
 
 
-
-def publish_app_state():
-    if mqtt_client and mqtt_client.is_connected():
-        state = json.dumps({"state-data": APP_STATE})
-        mqtt_client.publish("STATE", state, qos=1)
-        logger.debug("Published APP_STATE to STATE Topic")
-
-def state_changed():
-    publish_app_state()
-    update_ui_buttons()
-
-def update_ui_buttons():
-    """Update the play button UI based on play_status from APP_STATE.
-
-    This function only updates UI elements, not state. State should be
-    updated via APP_STATE and synced through the STATE process.
-    """
-    play_status = APP_STATE["play_status"]
-
-    if play_status == "playing":
-        # Update button to show PAUSE
-        if UI_ELEMENTS['play_button']:
-            UI_ELEMENTS['play_button'].props('icon=pause')
-            UI_ELEMENTS['play_button'].text = "PAUSE"
-    elif play_status == "paused":
-        # Update button to show RESUME
-        if UI_ELEMENTS['play_button']:
-            UI_ELEMENTS['play_button'].props('icon=play_arrow')
-            UI_ELEMENTS['play_button'].text = "RESUME"
-    elif play_status == "stopped":
-        # Update button to show PLAY
-        if UI_ELEMENTS['play_button']:
-            UI_ELEMENTS['play_button'].props('icon=play_arrow')
-            UI_ELEMENTS['play_button'].text = "PLAY"
+def advance_newline() -> None:
+    if require_file():
+        send_typer("advance_newline")
 
 
+def advance_token() -> None:
+    if require_file():
+        send_typer("advance_token")
 
-async def open_native_file_dialog():
-    """Called when the NiceGUI button is clicked."""
-    result = await app.native.main_window.create_file_dialog(allow_multiple=False)
 
-    if result and len(result) > 0:
-        path = result[0]
-        UI_ELEMENTS['file_input'].value = path
-        ui.notify(f'File chosen: {path}')
+def handle_hotkey_trigger(slot: Any) -> None:
+    actions = {1: toggle_playback, 2: stop_playback, 3: advance_newline, 4: advance_token}
+    action = actions.get(slot)
+    if action:
+        action()
 
-        # Stop any active playback before loading new file
-        if APP_STATE['play_status'] in ['playing', 'paused']:
-            logger.info("Stopping playback due to new file load")
-            APP_STATE['play_status'] = 'stopped'
-            ui.notify("Stopping playback...")
-            state_changed()
 
-        try:
-            # Read and display file contents in UI
-            with open(path, 'r', encoding='utf-8') as fc:
-                APP_STATE['loaded_file_data'] = fc.read()
-            APP_STATE["source_file_path"] = path
+# ------------------------------------------------------------------ files
 
-            # Update the code display
-            if UI_ELEMENTS['source_code_display']:
-                UI_ELEMENTS['source_code_display'].set_content(APP_STATE['loaded_file_data'])
-
-            # Send load_file command to typer process
-            if mqtt_client and mqtt_client.is_connected():
-                load_msg = json.dumps({"cmd": "load_file", "file": path})
-                mqtt_client.publish("TYPER", load_msg, qos=1)
-                logger.info(f"Sent load_file command to TYPER for: {path}")
-            else:
-                logger.warning("MQTT client not connected, cannot send file to typer")
-
-        except Exception as e:
-            ui.notify(f'Error loading file: {e}', type='negative')
-            logger.error(f'Error loading file {path}: {e}')
-
-def open_source_folder():
-    """Open the folder containing the source file in Windows Explorer."""
-    source_path = APP_STATE.get('source_file_path')
-
-    if not source_path:
-        ui.notify("No source file loaded", type='warning')
-        logger.warning("Attempted to open folder but no source file is loaded")
-        return
-
+def read_source(path: str) -> Optional[str]:
     try:
-        # Get the directory containing the file
-        folder_path = os.path.dirname(os.path.abspath(source_path))
+        with open(path, "r", encoding="utf-8-sig") as f:
+            return f.read()
+    except UnicodeDecodeError:
+        ui.notify("File is not UTF-8 text", type="negative")
+    except OSError as e:
+        ui.notify(f"Error reading file: {e}", type="negative")
+    return None
 
-        # Open the folder in Windows Explorer
-        subprocess.Popen(f'explorer "{folder_path}"')
-        logger.info(f"Opened folder in Explorer: {folder_path}")
-        ui.notify(f"Opened folder: {folder_path}")
+
+def load_source_file(path: str, announce: bool = True) -> None:
+    content = read_source(path)
+    if content is None:
+        return
+    if STATE["play_status"] != "stopped":
+        send_typer("stop")
+    STATE["source_file_path"] = path
+    STATE["progress"] = (0, 0)
+    SETTINGS["last_file"] = path
+    save_settings()
+    if UI.get("file_input"):
+        UI["file_input"].value = path
+    show_preview(path, content)
+    send_typer("load_file", file=path)
+    update_status()
+    if announce:
+        ui.notify(f"Loaded {Path(path).name}")
+
+
+def show_preview(path: str, content: str) -> None:
+    container = UI.get("preview_container")
+    if container is None:
+        return
+    container.clear()
+    language = LANGUAGES.get(Path(path).suffix.lower(), "text")
+    with container:
+        ui.code(content.replace("```", "``​`"), language=language).classes("w-full")
+
+
+def refresh_preview() -> None:
+    path = STATE["source_file_path"]
+    if path:
+        content = read_source(path)
+        if content is not None:
+            show_preview(path, content)
+
+
+async def choose_file() -> None:
+    start_dir = str(Path(STATE["source_file_path"]).parent) if STATE["source_file_path"] else ""
+    try:
+        result = await app.native.main_window.create_file_dialog(directory=start_dir, allow_multiple=False)
     except Exception as e:
-        ui.notify(f'Error opening folder: {e}', type='negative')
-        logger.error(f'Error opening folder for {source_path}: {e}')
-
-def open_in_editor():
-    """Open the source file in VS Code if available, otherwise in Notepad."""
-    source_path = APP_STATE.get('source_file_path')
-
-    if not source_path:
-        ui.notify("No source file loaded", type='warning')
-        logger.warning("Attempted to open file in editor but no source file is loaded")
+        ui.notify(f"Could not open file dialog: {e}", type="negative")
         return
+    if result:
+        load_source_file(result[0])
 
+
+def open_source_folder() -> None:
+    if not require_file():
+        return
+    path = os.path.normpath(STATE["source_file_path"])
     try:
-        # Try to open with VS Code first
-        try:
-            # Try 'code' command (VS Code CLI)
-            subprocess.Popen(['code', source_path])
-            logger.info(f"Opened file in VS Code: {source_path}")
+        subprocess.Popen(f'explorer /select,"{path}"')
+    except OSError as e:
+        ui.notify(f"Error opening folder: {e}", type="negative")
+
+
+def open_in_editor() -> None:
+    if not require_file():
+        return
+    path = STATE["source_file_path"]
+    no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    code = shutil.which("code")
+    try:
+        if code:
+            subprocess.Popen([code, path], creationflags=no_window)
             ui.notify("Opened in VS Code")
-        except (FileNotFoundError, OSError):
-            # VS Code not found, try notepad as fallback
-            logger.info("VS Code not found, falling back to Notepad")
-            subprocess.Popen(['notepad.exe', source_path])
-            logger.info(f"Opened file in Notepad: {source_path}")
+        else:
+            subprocess.Popen(["notepad.exe", path])
             ui.notify("Opened in Notepad (VS Code not found)")
-    except Exception as e:
-        ui.notify(f'Error opening file in editor: {e}', type='negative')
-        logger.error(f'Error opening file {source_path} in editor: {e}')
-
-# UI callback functions
-def update_slider_label(e):
-    logger.debug(f"Ghost Coder Speed Changed: {e.value}")
-    APP_STATE['typing_speed_value'] = int(e.value)
-    UI_ELEMENTS['typing_speed_value'] = int(e.value)
-    UI_ELEMENTS['typing_speed_label'].set_text(f"Ghost Coding Speed: {int(e.value)} ms")
-    publish_app_state()
-
-def toggle_pause_on_new_line(e):
-    logger.debug(f"Auto pause on new line: {e.value}")
-    APP_STATE['pause_on_new_line'] = e.value
-    publish_app_state()
-
-def start_playback_paused(e):
-    logger.debug(f"Start playback paused: {e.value}")
-    APP_STATE['start_playback_paused'] = e.value
-    publish_app_state()
-
-def toggle_auto_home_on_newline(e):
-    logger.debug(f"Auto home on newline: {e.value}")
-    APP_STATE['auto_home_on_newline'] = e.value
-    publish_app_state()
-
-def toggle_control_on_newline(e):
-    logger.debug(f"Control on newline: {e.value}")
-    APP_STATE['control_on_newline'] = e.value
-    publish_app_state()
-
-def toggle_replace_quad_spaces_with_tab(e):
-    logger.debug(f"Replace quad spaces with tab: {e.value}")
-    APP_STATE['replace_quad_spaces_with_tab'] = e.value
-    publish_app_state()
-
-def toggle_pause_on_app_change(e):
-    logger.debug(f"Pause On App Focus Change: {e.value}")
-    APP_STATE['pause_on_window_not_focused'] = e.value
-    publish_app_state()
-
-def toggle_refocus_on_resume(e):
-    logger.debug(f"Refocus Window On Resume: {e.value}")
-    APP_STATE['refocus_window_on_resume'] = e.value
-    publish_app_state()
-    # Publish to STATE topic
-
-def toggle_varied_coding_speed(e):
-    logger.debug(f"Varied coding speed: {e.value}")
-    APP_STATE['varied_coding_speed'] = e.value
-    publish_app_state()
-
-def toggle_playback():
-    # Check if a file is loaded
-    if not APP_STATE.get('source_file_path'):
-        ui.notify("No source file is loaded", type='warning')
-        logger.warning("Play clicked but no source file is loaded")
-        return
-
-    current_status = APP_STATE.get('play_status')
-
-    if current_status == 'playing':
-        logger.info("Pause clicked")
-        APP_STATE['play_status'] = 'paused'
-        publish_app_state()
-        ui.notify("Pausing Playback...")
-
-    elif current_status == 'paused':
-        logger.info("Resume clicked")
-        APP_STATE['play_status'] = 'playing'
-        publish_app_state()
-        ui.notify("Resuming Playback...")
-        if mqtt_client and mqtt_client.is_connected():
-            load_msg = json.dumps({"cmd": "play"})
-            mqtt_client.publish("TYPER", load_msg, qos=1)
-            logger.info(f"Sent play command TYPER")
-        else:
-            logger.warning("MQTT client not connected, cannot send file to typer")
-
-    else:  # stopped
-        logger.info("Play clicked")
-        APP_STATE['play_status'] = 'playing'
-        publish_app_state()
-
-        if mqtt_client and mqtt_client.is_connected():
-            load_msg = json.dumps({"cmd": "play"})
-            mqtt_client.publish("TYPER", load_msg, qos=1)
-            logger.info(f"Sent play command TYPER")
-        else:
-            logger.warning("MQTT client not connected, cannot send file to typer")
-        ui.notify("Starting playback in 5 seconds")
-    state_changed()
-
-def stop_playback():
-    # Check if playback is actually running
-    current_status = APP_STATE.get('play_status')
-    if current_status == 'stopped':
-        ui.notify("No source is playing", type='warning')
-        logger.warning("Stop clicked but nothing is playing")
-        return
-
-    logger.info("Stop playback clicked")
-    APP_STATE['play_status'] = 'stopped'
-    ui.notify("Stopping playback...")
-    state_changed()
-
-def on_advance_newline_button():
-    # Check if a file is loaded
-    if not APP_STATE.get('source_file_path'):
-        ui.notify("No source file is loaded", type='warning')
-        logger.warning("Advance newline clicked but no source file is loaded")
-        return
-
-    # Check if playback has started
-    current_status = APP_STATE.get('play_status')
-    if current_status == 'stopped':
-        ui.notify("Playback has not started yet", type='warning')
-        logger.warning("Advance newline clicked but playback has not started")
-        return
-
-    logger.info("Advance to newline clicked")
-
-    # Send advance_newline command to typer process
-    if mqtt_client and mqtt_client.is_connected():
-        advance_msg = json.dumps({"cmd": "advance_newline"})
-        mqtt_client.publish("TYPER", advance_msg, qos=1)
-        logger.info("Sent advance_newline command to TYPER")
-        ui.notify("Advancing to newline")
-    else:
-        logger.warning("MQTT client not connected")
-
-def on_advance_token_button():
-    # Check if a file is loaded
-    if not APP_STATE.get('source_file_path'):
-        ui.notify("No source file is loaded", type='warning')
-        logger.warning("Advance token clicked but no source file is loaded")
-        return
-
-    # Check if playback has started
-    current_status = APP_STATE.get('play_status')
-    if current_status == 'stopped':
-        ui.notify("Playback has not started yet", type='warning')
-        logger.warning("Advance token clicked but playback has not started")
-        return
-
-    logger.info("Advance to token clicked")
-
-    # Send advance_token command to typer process
-    if mqtt_client and mqtt_client.is_connected():
-        advance_msg = json.dumps({"cmd": "advance_token"})
-        mqtt_client.publish("TYPER", advance_msg, qos=1)
-        logger.info("Sent advance_token command to TYPER")
-        ui.notify("Advancing token")
-    else:
-        logger.warning("MQTT client not connected")
+    except OSError as e:
+        ui.notify(f"Error opening editor: {e}", type="negative")
 
 
-def show_hotkey_dialog(slot: int, button_name: str):
-    """Show a dialog to configure a hotkey for the given slot."""
-    with ui.dialog() as dialog, ui.card():
-        ui.label(f'Configure Hotkey for {button_name}').classes('text-lg font-bold')
+# --------------------------------------------------------------- settings UI
+
+def set_setting(key: str, value: Any) -> None:
+    SETTINGS[key] = value
+    save_settings()
+    if key in DEFAULT_SETTINGS:
+        publish_settings()
+
+
+def setting_checkbox(label: str, key: str, tooltip: str) -> None:
+    ui.checkbox(label, value=bool(SETTINGS[key]),
+                on_change=lambda e: set_setting(key, bool(e.value))).tooltip(tooltip)
+
+
+# ---------------------------------------------------------------- hotkeys UI
+
+def show_hotkey_dialog(slot: int) -> None:
+    with ui.dialog() as dialog, ui.card().classes("min-w-[320px]"):
+        ui.label(f"Hotkey for {SLOT_NAMES[slot]}").classes("text-lg font-bold")
         ui.separator()
-
-        with ui.column().classes('gap-2'):
-            ui.button('Keyboard Hotkey',
-                     icon='keyboard',
-                     on_click=lambda: set_hotkey(slot, 'keyboard', dialog)).classes('w-full')
-            ui.button('Mouse Hotkey',
-                     icon='mouse',
-                     on_click=lambda: set_hotkey(slot, 'mouse', dialog)).classes('w-full')
-            ui.button('Gamepad Hotkey',
-                     icon='sports_esports',
-                     on_click=lambda: set_hotkey(slot, 'gamepad', dialog)).classes('w-full')
-            ui.button('Clear Hotkey',
-                     icon='clear',
-                     on_click=lambda: clear_hotkey(slot, dialog)).classes('w-full')
-            ui.separator()
-            ui.button('Cancel (or press ESC)',
-                     icon='close',
-                     on_click=lambda: dialog.close()).classes('w-full')
-
-        # Add keyboard handler for escape key to close dialog
-        # Note: If in recording mode, the listener will handle ESC and cancel the registration
-        dialog.on('keydown.esc', lambda: dialog.close())
-
+        with ui.column().classes("w-full gap-2"):
+            for source, icon in (("keyboard", "keyboard"), ("mouse", "mouse"), ("gamepad", "sports_esports")):
+                ui.button(f"{source.capitalize()} hotkey", icon=icon,
+                          on_click=lambda s=source: (dialog.close(), start_recording(slot, s))).classes("w-full")
+            ui.button("Clear hotkey", icon="clear", color="negative",
+                      on_click=lambda: (dialog.close(), clear_hotkey(slot))).classes("w-full")
+            ui.button("Cancel", icon="close", on_click=dialog.close).props("flat").classes("w-full")
     dialog.open()
 
-def set_hotkey(slot: int, input_type: str, dialog):
-    """Send MQTT command to register a hotkey."""
-    if mqtt_client and mqtt_client.is_connected():
-        register_msg = json.dumps({
-            "cmd": "register",
-            "slot": slot,
-            "input": input_type,
-            "suppress": False
-        })
-        mqtt_client.publish("LISTENER", register_msg, qos=1)
-        logger.info(f"Sent register command for slot {slot} with input {input_type}")
-        ui.notify(f"Press/click the {input_type} input now to register hotkey...")
+
+def start_recording(slot: int, source: str) -> None:
+    if not publish("LISTENER", {"cmd": "register", "slot": slot, "input": source}):
+        ui.notify("Internal message broker not connected", type="negative")
+        return
+    prompts = {"keyboard": "Press a key", "mouse": "Click a mouse button (not left) or scroll",
+               "gamepad": "Press a gamepad button, D-pad direction or trigger"}
+    with ui.dialog().props("persistent") as dialog, ui.card().classes("items-center"):
+        ui.spinner(size="lg")
+        ui.label(f"{prompts[source]} for '{SLOT_NAMES[slot]}'").classes("text-lg")
+        ui.label("Press ESC to cancel (times out after 15 s)").classes("text-sm opacity-70")
+        ui.button("Cancel", on_click=lambda: publish("LISTENER", {"cmd": "cancel"})).props("flat")
+    UI["recording_dialog"] = dialog
+    dialog.open()
+
+
+def close_recording_dialog() -> None:
+    dialog = UI.pop("recording_dialog", None)
+    if dialog:
         dialog.close()
-    else:
-        logger.warning("MQTT client not connected")
-        ui.notify("MQTT not connected", type='negative')
-        dialog.close()
+        dialog.delete()
 
-def clear_hotkey(slot: int, dialog):
-    """Clear the hotkey for the given slot."""
-    if mqtt_client and mqtt_client.is_connected():
-        unregister_msg = json.dumps({
-            "cmd": "unregister",
-            "slot": slot
-        })
-        mqtt_client.publish("LISTENER", unregister_msg, qos=1)
-        logger.info(f"Sent unregister command for slot {slot}")
 
-        # Update local state
-        APP_STATE['hotkeys'][slot] = None
-        update_hotkey_labels()
-        save_hotkeys()  # Auto-save when hotkey is cleared
+def clear_hotkey(slot: int) -> None:
+    publish("LISTENER", {"cmd": "unregister", "slot": slot})
+    STATE["hotkeys"][slot] = None
+    STATE["inactive_hotkeys"].discard(slot)
+    save_hotkeys()
+    update_hotkey_labels()
+    ui.notify(f"Hotkey for '{SLOT_NAMES[slot]}' cleared")
 
-        ui.notify(f"Hotkey cleared")
-        dialog.close()
-    else:
-        logger.warning("MQTT client not connected")
-        ui.notify("MQTT not connected", type='negative')
-        dialog.close()
 
-def update_hotkey_labels():
-    """Update the hotkey label displays and button borders."""
-    hotkey_names = {
-        1: "Play | Pause | Resume",
-        2: "Stop",
-        3: "Adv. to newline",
-        4: "Adv. Token"
-    }
+def describe_hotkey(hotkey: dict[str, Any]) -> str:
+    source = str(hotkey.get("source", "")).capitalize()
+    return f"{source}: {hotkey.get('value', '')}"
 
-    # Map slots to button elements
-    button_map = {
-        1: UI_ELEMENTS.get('play_button'),
-        2: UI_ELEMENTS.get('stop_button'),
-        3: UI_ELEMENTS.get('advance_to_next_newline_button'),
-        4: UI_ELEMENTS.get('advance_to_next_token_button')
-    }
 
-    for slot, label in UI_ELEMENTS['hotkey_labels'].items():
+def update_hotkey_labels() -> None:
+    for slot, name in SLOT_NAMES.items():
+        label = UI.get(f"hotkey_label_{slot}")
+        button = UI.get(f"button_{slot}")
+        hotkey = STATE["hotkeys"].get(slot)
+        inactive = slot in STATE["inactive_hotkeys"]
         if label:
-            hotkey_info = APP_STATE['hotkeys'].get(slot)
-            button = button_map.get(slot)
-
-            if hotkey_info:
-                source = hotkey_info.get('source', '').capitalize()
-                value = hotkey_info.get('value', '')
-                label.set_text(f"{hotkey_names[slot]}: [{source}: {value}]")
-
-                # Add green border to button if hotkey is set
-                if button:
-                    button.style('border: 2px solid green')
+            if hotkey:
+                suffix = " (device not connected)" if inactive else ""
+                label.set_text(f"{name}: {describe_hotkey(hotkey)}{suffix}")
             else:
-                label.set_text(f"{hotkey_names[slot]}: []")
-
-                # Remove green border from button if no hotkey
-                if button:
-                    button.style('border: none')
-
-def play_button_set_hotkey(e):
-    show_hotkey_dialog(1, "Play/Pause/Resume")
-
-def stop_button_set_hotkey(e):
-    show_hotkey_dialog(2, "Stop")
-
-def advance_to_next_newline_button_set_hotkey(e):
-    show_hotkey_dialog(3, "Advance to Newline")
-
-def advance_to_next_token_button_set_hotkey(e):
-    show_hotkey_dialog(4, "Advance to Token")
-
-def handle_hotkey_trigger(slot: int):
-    """Handle a hotkey trigger event from the listener."""
-    if slot == 1:  # Play/Pause/Resume
-        toggle_playback()
-    elif slot == 2:  # Stop
-        stop_playback()
-    elif slot == 3:  # Advance to newline
-        on_advance_newline_button()
-    elif slot == 4:  # Advance to token
-        on_advance_token_button()
-    else:
-        logger.warning(f"Unknown hotkey slot: {slot}")
+                label.set_text(f"{name}: not set")
+        if button:
+            color = "orange" if inactive else "#21ba45"
+            button.style(f"outline: 2px solid {color}; outline-offset: 2px" if hotkey else "outline: none")
 
 
+# ----------------------------------------------------------------- status UI
+
+def update_status() -> None:
+    status = STATE["play_status"]
+    play_button = UI.get("button_1")
+    if play_button:
+        if status == "playing":
+            play_button.props("icon=pause")
+            play_button.text = "PAUSE"
+        else:
+            play_button.props("icon=play_arrow")
+            play_button.text = "RESUME" if status == "paused" else "PLAY"
+
+    label = UI.get("status_label")
+    if label:
+        if status == "playing" and STATE["countdown"] > 0:
+            text = f"Starting in {STATE['countdown']}s… click into your target window"
+        elif status == "stopped":
+            text = "Stopped"
+        else:
+            target = STATE["target_title"]
+            text = status.capitalize() + (f" → {target}" if target else "")
+        label.set_text(text)
+
+    done, total = STATE["progress"]
+    if UI.get("progress_bar"):
+        UI["progress_bar"].set_value(done / total if total else 0)
+    if UI.get("progress_label"):
+        UI["progress_label"].set_text(f"{done} / {total} tokens" if total else "")
 
 
-def build_ui():
-    """Build the main UI layout."""
-    ui.timer(0.01, check_mqtt_messages)
+# ------------------------------------------------------------------- layout
 
+def build_ui() -> None:
+    """Root page; NiceGUI calls this for every client connection."""
+    dark = ui.dark_mode(value=bool(SETTINGS["dark_mode"]))
+    ui.timer(0.05, check_mqtt_messages)
+    ui.timer(1.0, monitor_processes)
 
-    with ui.row().classes('w-full').style('position: relative; gap: 0;'):
+    with ui.row().classes("w-full no-wrap gap-0"):
+        with ui.column().classes("p-2 gap-1").style("width: 45%; min-width: 520px"):
+            ui.label("How to use").classes("font-bold text-xl")
+            ui.label("1. Select the source file to play back")
+            ui.label("2. Adjust playback speed and options")
+            ui.label("3. Right-click a control button to assign a global hotkey")
+            ui.label("4. Press Play, then click into your editor before the countdown ends")
+            ui.separator().classes("my-2")
 
-    
-        # Left pane - Controls
-        with ui.column().classes('p-4').style('gap: 0.1rem; width: 45%;'):
-            ui.label("How to use this App:").classes('font-bold text-xl')
-            ui.label("1. Select the source code file to play back")
-            ui.label("2. Adjust playback speed and settings")
-            ui.label("3. Set global hotkeys for playback control")
-            ui.label("4. Start playback using controls or hotkeys")
-            ui.separator().style("height:0.175rem;")
+            ui.label("Source file").classes("font-bold")
+            UI["file_input"] = ui.input(value=STATE["source_file_path"]).props("readonly dense").classes("w-full")
+            with ui.row().classes("gap-2"):
+                ui.button("Select File", icon="file_open", on_click=choose_file)
+                ui.button("Open Folder", icon="folder_open", on_click=open_source_folder).props("outline")
+                ui.button("Open in Editor", icon="edit", on_click=open_in_editor).props("outline")
+                ui.button("Reload", icon="refresh", on_click=lambda: STATE["source_file_path"] and load_source_file(
+                    STATE["source_file_path"])).props("outline").tooltip("Re-read the file from disk")
+            ui.separator().classes("my-2")
 
-            ui.label("Source File to Play:").classes('font-bold')
-            UI_ELEMENTS['file_input'] = ui.input(value='').props('readonly').classes('w-full')
-            with ui.row():
-                UI_ELEMENTS['select_source_file_button'] = ui.button(
-                    'Select Source File To Play',
-                    icon='file_open',
-                    on_click=open_native_file_dialog
-                )
-                UI_ELEMENTS['open_folder_button'] = ui.button(
-                    'Open Folder',
-                    icon='folder_open',
-                    on_click=open_source_folder
-                )
-                UI_ELEMENTS['open_in_editor_button'] = ui.button(
-                    'Open in Editor',
-                    icon='edit',
-                    on_click=open_in_editor
-                )
+            speed_label = ui.label().classes("font-bold")
 
-            ui.separator().style("")
+            def on_speed(e):
+                speed_label.set_text(f"Typing speed: {int(e.value)} ms per keystroke")
+                set_setting("typing_speed_value", int(e.value))
 
-            UI_ELEMENTS['typing_speed_label'] = ui.label(f"Ghost Coding Speed: {UI_ELEMENTS['typing_speed_value']} ms").classes('font-bold')
-            ui.slider(min=50, max=500, step=25, value=50, on_change=update_slider_label).classes('w-full')
+            ui.slider(min=10, max=500, step=10, value=int(SETTINGS["typing_speed_value"]), on_change=on_speed)
+            speed_label.set_text(f"Typing speed: {int(SETTINGS['typing_speed_value'])} ms per keystroke")
 
-            with ui.row():
-                UI_ELEMENTS["advance_to_next_newline_button"] = ui.checkbox("Auto Pause on New Line", value=False, on_change=toggle_pause_on_new_line)
-                UI_ELEMENTS["start_playback_paused"] = ui.checkbox("Start Playback Paused", value=False, on_change=start_playback_paused)
+            delay_label = ui.label().classes("font-bold")
 
-            with ui.row():
-                UI_ELEMENTS["auto_home_on_newline"] = ui.checkbox("Auto Home on Newline", value=True, on_change=toggle_auto_home_on_newline)
-                UI_ELEMENTS["control_on_newline"] = ui.checkbox("Ctrl on Newline", value=True, on_change=toggle_control_on_newline)
-            with ui.row():
-                UI_ELEMENTS["replace_quad_spaces_with_tab"] = ui.checkbox("Replace Quad Spaces With Tab", value=True, on_change=toggle_replace_quad_spaces_with_tab)
-                UI_ELEMENTS["pause_on_window_not_focused"] = ui.checkbox("Pause Playback On App Focus Change", value=True, on_change=toggle_pause_on_app_change)
-            with ui.row():
-                UI_ELEMENTS["refocus_window_on_resume"] = ui.checkbox("Refocus Window On Resume", value=True, on_change=toggle_refocus_on_resume)
-                UI_ELEMENTS["varied_coding_speed"] = ui.checkbox("Varied Coding Speed", value=False, on_change=toggle_varied_coding_speed)
+            def on_delay(e):
+                delay_label.set_text(f"Start delay: {int(e.value)} s")
+                set_setting("start_delay", int(e.value))
 
-            ui.separator().style("height:0.175rem;")
+            ui.slider(min=0, max=10, step=1, value=int(SETTINGS["start_delay"]), on_change=on_delay)
+            delay_label.set_text(f"Start delay: {int(SETTINGS['start_delay'])} s")
 
-            with ui.row():
-                UI_ELEMENTS['play_button'] = ui.button("PLAY", icon='play_arrow', on_click=toggle_playback)
-                UI_ELEMENTS['play_button'].on('contextmenu', play_button_set_hotkey)
+            with ui.grid(columns=2).classes("w-full gap-x-4 gap-y-0"):
+                setting_checkbox("Varied typing speed", "varied_coding_speed",
+                                 "Add random jitter (-50 to +150 ms) to each keystroke")
+                setting_checkbox("Start playback paused", "start_playback_paused",
+                                 "Capture the target window, then wait for Resume / Advance")
+                setting_checkbox("Auto pause on new line", "pause_on_new_line",
+                                 "Pause after every line break")
+                setting_checkbox("Replace leading 4 spaces with Tab", "replace_quad_spaces_with_tab",
+                                 "Type indentation as Tab keys (lets the editor apply its own indent style)")
+                setting_checkbox("Auto Home on new line", "auto_home_on_newline",
+                                 "Press Home after each line break to skip editor auto-indent")
+                setting_checkbox("Ctrl+Enter for new lines", "control_on_newline",
+                                 "Use Ctrl+Enter (insert line below) instead of Enter; avoids auto-closed brackets")
+                setting_checkbox("Pause when target loses focus", "pause_on_window_not_focused",
+                                 "Pause if another window becomes active; otherwise focus is taken back")
+                setting_checkbox("Refocus target on resume", "refocus_window_on_resume",
+                                 "Bring the target window to the front when resuming")
+            ui.separator().classes("my-2")
 
-                UI_ELEMENTS['stop_button'] = ui.button("STOP", icon='stop', on_click=stop_playback)
-                UI_ELEMENTS['stop_button'].on('contextmenu', stop_button_set_hotkey)
-                UI_ELEMENTS['advance_to_next_newline_button'] = ui.button("ADV. NEWLINE", icon='fast_forward', on_click=on_advance_newline_button)
-                UI_ELEMENTS['advance_to_next_newline_button'].on('contextmenu', advance_to_next_newline_button_set_hotkey)
-                UI_ELEMENTS['advance_to_next_token_button'] = ui.button("ADV. TOKEN", icon='fast_forward', on_click=on_advance_token_button)
-                UI_ELEMENTS['advance_to_next_token_button'].on('contextmenu', advance_to_next_token_button_set_hotkey)
-
-            ui.separator().style("height:0.175rem;")
-            ui.separator().style("height:0.175rem;background-color:unset;")
-            ui.label("Hotkeys (right click a button to set):").classes('font-bold')
-
-            with ui.row().classes('w-full'):
-                with ui.column().style("width:48.5%;"):
-                    UI_ELEMENTS['hotkey_labels'][1] = ui.label("Play | Pause | Resume: []").classes('font-bold').style()
-                    UI_ELEMENTS['hotkey_labels'][2] = ui.label("Stop: []").classes('font-bold')
-                with ui.column().style("width:48.5%;"):
-                    UI_ELEMENTS['hotkey_labels'][4] = ui.label("Adv. Token: []").classes('font-bold')
-                    UI_ELEMENTS['hotkey_labels'][3] = ui.label("Adv. to newline: []").classes('font-bold')
-            with ui.row().classes('w-full'):
-                ui.separator().style("height:0.275rem;background-color:unset;")
-                ui.label("Misc. Settings:").classes('font-bold')
-                ui.separator().style("height:0.175rem;")
-                dark = ui.dark_mode()
-                ui.switch('Dark mode').bind_value(dark)
-
-        # Right pane - Source code display
-        with ui.column().classes('p-4').style('width: 55%; border-left: 2px solid #ccc;'):
-            ui.label("Source Code Preview:").classes('font-bold text-xl')
-            UI_ELEMENTS['source_code_display'] = ui.code('').classes('w-full').style('max-height: 800px; overflow: auto; font-size: 12px;')
-
-
-
-def main():
-    # Fix for NiceGUI when running as an installed entry point
-    # NiceGUI expects sys.argv[0] to be a Python file, but entry points create wrapper scripts
-    if not sys.argv[0].endswith('.py'):
-        sys.argv[0] = __file__
-
-    parser = argparse.ArgumentParser(description="Ghost Coder - MQTT-based coding assistant")
-    parser.add_argument("--port", type=int, help="Specify the MQTT broker port (overrides random port selection)")
-    parser.add_argument("--logging", action="store_true", help="Enable logging output")
-    parser.add_argument("--extmqtt", type=str, help="Use external MQTT broker (format: host:port)")
-    parser.add_argument("--extbroker", type=str, help="Use external MQTT broker (format: host:port)")
-    # args = parser.parse_args()
-    args, _unknown = parser.parse_known_args()
-
-    # Configure logging based on --logging flag
-    if args.logging:
-        logger.configure(
-            handlers=[
-                {
-                    "sink": "ghost_coder.log",
-                    "format": "[{time:YYYY-MM-DD HH:mm:ss}] {level} {name}:{function}:{line} - {message}",
-                    "rotation": "10 MB",
-                    "retention": "7 days",
-                    "level": "DEBUG"
-                },
-                {
-                    "sink": lambda msg: print(msg, end=""),
-                    "format": "[{time:YYYY-MM-DD HH:mm:ss}] {level} {name}:{function}:{line} - {message}",
-                    "level": "DEBUG"
+            with ui.row().classes("gap-2"):
+                buttons = {
+                    1: ui.button("PLAY", icon="play_arrow", on_click=toggle_playback),
+                    2: ui.button("STOP", icon="stop", on_click=stop_playback, color="negative"),
+                    3: ui.button("ADV. NEWLINE", icon="keyboard_return", on_click=advance_newline),
+                    4: ui.button("ADV. TOKEN", icon="fast_forward", on_click=advance_token),
                 }
-            ]
-        )
-        logger.enable("ghost_coder")
-        logger.info("Logging enabled - writing to ghost_coder.log and console")
-    else:
-        logger.disable("ghost_coder")
+                for slot, button in buttons.items():
+                    button.on("contextmenu.prevent", lambda _, s=slot: show_hotkey_dialog(s))
+                    button.tooltip("Right-click to assign a hotkey")
+                    UI[f"button_{slot}"] = button
 
-    # Parse external MQTT broker if provided (support both --extbroker and --extmqtt)
-    ext_broker_arg = args.extbroker or args.extmqtt
-    if ext_broker_arg:
-        try:
-            broker_host, broker_port_str = ext_broker_arg.split(":")
-            available_port = int(broker_port_str)
-            logger.info(f"Using external MQTT broker at {broker_host}:{available_port}")
-        except ValueError:
-            logger.error(f"Invalid --extbroker format: {ext_broker_arg}. Expected format: host:port")
-            print(f"Error: Invalid --extbroker format. Expected format: host:port (e.g., 127.0.0.1:1883)")
-            return
+            with ui.row().classes("w-full items-center gap-2 mt-2"):
+                ui.label("Status:").classes("font-bold")
+                UI["status_label"] = ui.label()
+            with ui.row().classes("w-full items-center no-wrap gap-2"):
+                UI["progress_bar"] = ui.linear_progress(value=0, show_value=False).classes("grow")
+                UI["progress_label"] = ui.label().classes("text-sm whitespace-nowrap")
+
+            ui.separator().classes("my-2")
+            ui.label("Hotkeys (right-click a button to set)").classes("font-bold")
+            with ui.grid(columns=2).classes("w-full gap-x-4 gap-y-0"):
+                for slot in SLOT_NAMES:
+                    UI[f"hotkey_label_{slot}"] = ui.label().classes("text-sm")
+
+            ui.separator().classes("my-2")
+            with ui.row().classes("items-center gap-4"):
+                ui.switch("Dark mode", value=bool(SETTINGS["dark_mode"]),
+                          on_change=lambda e: (dark.set_value(e.value), set_setting("dark_mode", bool(e.value))))
+                ui.label(f"v{__version__}").classes("text-xs opacity-60")
+
+        with ui.column().classes("p-2 pl-4 gap-2").style(
+                "width: 55%; height: calc(100vh - 2rem); border-left: 2px solid #8884"):
+            ui.label("Source preview").classes("font-bold text-xl")
+            UI["preview_container"] = ui.column().classes("w-full grow overflow-auto text-xs no-wrap")
+
+    update_hotkey_labels()
+    update_status()
+    if STATE["source_file_path"]:
+        refresh_preview()
+
+
+# --------------------------------------------------------------- processes
+
+def monitor_processes() -> None:
+    if SHUTTING_DOWN:
+        return
+    for name, proc in CHILD_PROCESSES.items():
+        if not proc.is_alive() and name not in DEAD_PROCESSES_REPORTED:
+            DEAD_PROCESSES_REPORTED.add(name)
+            logger.error(f"{name} process exited (code {proc.exitcode})")
+            ui.notify(f"Internal {name} process stopped unexpectedly (exit code {proc.exitcode}). "
+                      f"Please restart Ghost Coder.", type="negative", timeout=0, close_button=True)
+
+
+def on_shutdown() -> None:
+    global SHUTTING_DOWN
+    SHUTTING_DOWN = True
+    if mqtt_client:
+        if mqtt_client.is_connected():
+            info = mqtt_client.publish("APP", json.dumps({"command": "CLOSE"}), qos=1)
+            try:
+                info.wait_for_publish(timeout=1.0)
+            except Exception:
+                pass
+        mqtt_client.loop_stop()
+        mqtt_client.disconnect()
+    for name, proc in CHILD_PROCESSES.items():
+        proc.join(timeout=2)
+        if proc.is_alive():
+            logger.info(f"Terminating {name} process")
+            proc.terminate()
+            proc.join(timeout=2)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="ghost-coder", description="Ghost Coder - automated code playback")
+    parser.add_argument("--port", type=int, help="port for the internal MQTT broker (default: random free port)")
+    parser.add_argument("--logging", action="store_true", help=f"write debug logs to {log_file()} and the console")
+    parser.add_argument("--extbroker", "--extmqtt", dest="extbroker", metavar="HOST:PORT",
+                        help="use an external MQTT broker instead of the internal one")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    args, _unknown = parser.parse_known_args()
+    return args
+
+
+def main() -> None:
+    mp.freeze_support()
+    args = parse_args()
+
+    if args.logging:
+        rotate_log_if_large()
+    setup_logging(args.logging)
+    logger.info(f"Starting {APP_TITLE}")
+
+    if args.extbroker:
+        host, _, port_str = args.extbroker.rpartition(":")
+        if not host or not port_str.isdigit():
+            print("Error: --extbroker must be HOST:PORT (e.g. 127.0.0.1:1883)", file=sys.stderr)
+            sys.exit(2)
+        broker_host, broker_port = host, int(port_str)
     else:
         broker_host = "127.0.0.1"
-        # Use specified port or get a random one
-        if args.port:
-            available_port = args.port
-            logger.info(f"Using specified port: {available_port}")
-        else:
-            available_port = get_random_available_port()
-            logger.info(f"Random port: {available_port}")
+        broker_port = args.port or get_random_available_port()
 
-    # Start child processes
-    child_processes = {}
+    if not args.extbroker:
+        CHILD_PROCESSES["broker"] = mp.Process(target=broker_process, args=(broker_host, broker_port, args.logging),
+                                               name="broker", daemon=True)
+        CHILD_PROCESSES["broker"].start()
 
-    # Start broker process only if not using external broker
-    if not ext_broker_arg:
-        logger.info("Starting broker process")
-        child_processes["broker"] = mp.Process(target=broker_process, args=(broker_host, available_port, args.logging), name="broker")
-        child_processes["broker"].start()
+    broker = CHILD_PROCESSES.get("broker")
+    if not wait_for_port(broker_host, broker_port, timeout=15, alive=lambda: broker is None or broker.is_alive()):
+        logger.error(f"MQTT broker at {broker_host}:{broker_port} is not reachable")
+        print(f"Error: MQTT broker at {broker_host}:{broker_port} is not reachable", file=sys.stderr)
+        for proc in CHILD_PROCESSES.values():
+            proc.terminate()
+        sys.exit(1)
 
-        # Wait a moment for broker to start
-        time.sleep(1)
-    else:
-        logger.info("Skipping internal broker - using external MQTT broker")
+    for name, target in (("listener", listener_process), ("typer", typer_process)):
+        CHILD_PROCESSES[name] = mp.Process(target=target, args=(broker_host, broker_port, args.logging),
+                                           name=name, daemon=True)
+        CHILD_PROCESSES[name].start()
 
-    # Start listener process
-    logger.info("Starting listener process")
-    child_processes["listener"] = mp.Process(target=listener_process, args=(broker_host, available_port, args.logging), name="listener")
-    child_processes["listener"].start()
-
-    # Start typer process
-    logger.info("Starting typer process")
-    child_processes["typer"] = mp.Process(target=typer_process, args=(broker_host, available_port, args.logging), name="typer")
-    child_processes["typer"].start()
-
-    # Setup UI in main thread
-    app.native.window_args['resizable'] = False
-    
-    def on_shutdown():
-        """Send CLOSE message when UI is closing."""
-        if mqtt_client and mqtt_client.is_connected():
-            logger.info("UI closing, sending CLOSE message to APP topic")
-            close_msg = json.dumps({"command": "CLOSE"})
-            mqtt_client.publish("APP", close_msg, qos=1)
-            mqtt_client.loop_stop()
-            mqtt_client.disconnect()
-            logger.info("UI MQTT client disconnected")
-        
-        # Terminate child processes
-        for cpn, cp in child_processes.items():
-            if cp and cp.is_alive():
-                logger.info(f"Terminating {cpn} process")
-                cp.terminate()
-                cp.join(timeout=5)
-    
-    app.on_shutdown(on_shutdown)
-    
-    # Load saved hotkeys before building UI
+    load_settings()
     load_hotkeys()
+    last_file = SETTINGS.get("last_file")
+    if last_file and Path(last_file).is_file():
+        STATE["source_file_path"] = last_file
 
-    # Build UI
-    build_ui()
+    setup_mqtt_client(broker_host, broker_port)
+    app.on_shutdown(on_shutdown)
 
-    # Setup MQTT after UI is ready
-    def on_mqtt_ready():
-        setup_mqtt_client(broker_host, available_port)
-        # Wait a bit for MQTT to connect, then send hotkeys and update UI
-        ui.timer(1.0, lambda: (send_hotkeys_to_listener(), update_hotkey_labels()), once=True)
-
-    ui.timer(0.5, on_mqtt_ready, once=True)
-    
-    # Start process monitor in background
-    def monitor_processes():
-        dead_processes_reported = set()
-        for cpn, cp in child_processes.items():
-            if cp and not cp.is_alive() and cpn not in dead_processes_reported:
-                logger.warning(f"Process '{cpn}' is no longer alive (exit code: {cp.exitcode})")
-                dead_processes_reported.add(cpn)
-                if mqtt_client and mqtt_client.is_connected():
-                    message = json.dumps({
-                        "message": f"{cpn.upper()} PROCESS ENDED",
-                        "process": cpn,
-                        "exit_code": cp.exitcode
-                    })
-                    mqtt_client.publish("APP", message, qos=1)
-
-    ui.timer(0.5, monitor_processes)  # Check every half second
-    # ui.timer(1, publish_app_state) 
-    
-    logger.info("Starting UI in main thread")
     ui.run(
-        title=f"Ghost Coder {APP_VERSION}",
+        build_ui,
+        title=APP_TITLE,
         native=True,
-        window_size=(1600, 900),
+        window_size=(1400, 900),
         reload=False,
-        storage_secret='ghost-coder-secret-key',
-	port=9999
+        show_welcome_message=False,
+        favicon=ICON_FILE if ICON_FILE.exists() else None,
     )
 
+
 if __name__ == "__main__":
-    mp.freeze_support()
-    if mp.current_process().name == 'MainProcess':
-        try:
-            mp.set_start_method("spawn")
-        except RuntimeError:
-            pass
-        main()
+    main()

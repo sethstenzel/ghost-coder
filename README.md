@@ -6,164 +6,186 @@
 
 ## So what is it?!
 
-Ghost Coder is a Windows application that allows you to load a source code file and automatically "type" it into any text editor or IDE, simulating realistic coding. Perfect for creating coding tutorials, recording demos, or practicing presentations without the stress of live coding.
+Ghost Coder is a Windows application that loads a source file and "types" it into any editor or IDE, keystroke by keystroke, so it looks like you are coding live. Use it for tutorials, recorded demos or presentations without the stress (and typos) of live coding. Global hotkeys (keyboard, mouse or gamepad) let you pause, resume and step through the code while the editor stays in focus.
 
 ## Features
 
-- **Automated Typing Playback**: Load any text/code file and have it automatically typed character-by-character
-- **Hotkey Control**: Configure global keyboard, mouse, or gamepad hotkeys to control playback from any application
-- **Customizable Speed**: Adjust typing speed from 50ms to 500ms per character
-- **Advanced Playback Options**:
-  - Variable typing speed for more realistic coding simulation
-  - Auto-pause on new lines
-  - Start playback in paused mode
-  - Auto-home cursor on newline
-  - Quad-space to Tab replacement
-  - Window focus detection with auto-pause
-- **Special Syntax Support**: Includes special commands for pauses, scrolling, and repeated keys
-- **Modern GUI**: Built with NiceGUI for an intuitive interface with dark mode support
-- **MQTT-Based Architecture**: Multi-process design for responsive control and monitoring
+- **Automated typing playback** of any UTF-8 text/code file into the window you choose
+- **Global hotkeys** for Play/Pause/Resume, Stop, Advance to Newline and Advance Token (keyboard, mouse buttons/scroll, gamepad buttons, D-pad and triggers)
+- **Adjustable speed** (10–500 ms per keystroke) with optional random variation for natural-looking typing
+- **Configurable start delay** (0–10 s) to click into your editor after pressing Play
+- **Stepping**: pause on every new line, step one word/token at a time, or run to the end of the current line
+- **Editor-friendly newlines**: Ctrl+Enter and auto-Home options to cooperate with IDE auto-indent and auto-closed brackets
+- **Focus safety**: playback pauses automatically if another window takes focus, so keystrokes never land in the wrong app
+- **Markers** in the source file for pauses, timed pauses, key presses, shortcuts and scrolling
+- **Live progress** and status, source preview with syntax highlighting, dark mode
+- Settings, hotkeys and last file are remembered between sessions
 
 ## Installation
 
-### From PyPI (Coming Soon)
+### Windows installer (recommended)
+
+Download `GhostCoder-Setup-<version>.exe` from the [releases](https://github.com/sethstenzel/ghost-coder/releases) and run it. It installs per-user (no admin rights needed) to `%LOCALAPPDATA%\Programs\Ghost Coder` and adds a Start Menu shortcut.
+
+Requires the Microsoft Edge WebView2 runtime (pre-installed on Windows 11 and up-to-date Windows 10).
+
+### From PyPI (coming soon)
 
 ```bash
 pip install ghost-coder
+ghost-coder
 ```
 
-### From Source
+### From source
 
-1. Clone the repository:
 ```bash
 git clone https://github.com/sethstenzel/ghost-coder.git
 cd ghost-coder
-```
-
-2. Install dependencies:
-```bash
-pip install -e .
+uv sync
+uv run ghost-coder
 ```
 
 ## Usage
 
-### Basic Usage
+1. Click **Select File** and choose the source file to play back.
+2. Adjust speed and options.
+3. Right-click any control button to assign a global hotkey.
+4. Press **Play** (or your hotkey), then click into your editor before the countdown ends. The window that has focus when the countdown finishes becomes the target.
+5. Use Pause/Resume, Advance Newline and Advance Token to control the pace.
 
-1. Run Ghost Coder:
-```bash
-ghost-coder
+Tip: with a hotkey you can start playback while your editor already has focus. Set the start delay to 0 for an instant start.
+
+### Controls
+
+| Control | Behaviour |
+| --- | --- |
+| **Play / Pause / Resume** | Starts playback (after the start delay), pauses it, or resumes it. |
+| **Stop** | Stops playback. The next Play starts from the top of the file and re-reads it from disk. |
+| **Advance Newline** | While paused: types up to and including the next line break, then pauses again. While playing: pauses at the end of the current line. |
+| **Advance Token** | While paused: types the next word (or marker) and pauses again. |
+
+### Hotkeys
+
+Right-click a control button and choose Keyboard, Mouse or Gamepad, then press the input you want to use. ESC cancels registration, which also times out after 15 s.
+
+- Keyboard: any key (function keys such as F9 work well).
+- Mouse: right, middle and side buttons or scroll directions. The left button is not allowed.
+- Gamepad: buttons, D-pad directions and analog triggers. Analog sticks are ignored.
+
+Each input can only be bound to one control. Keystrokes produced by Ghost Coder itself never trigger hotkeys. A saved gamepad hotkey whose controller is not connected is kept and shown as inactive.
+
+### Options
+
+| Option | Description |
+| --- | --- |
+| Typing speed | Delay per keystroke (10–500 ms). |
+| Start delay | Countdown after pressing Play before the target window is captured (0–10 s). |
+| Varied typing speed | Adds random jitter (-50 ms to +150 ms) to every keystroke. |
+| Start playback paused | Captures the target window, then waits for Resume or Advance. |
+| Auto pause on new line | Pauses after every line break. |
+| Replace leading 4 spaces with Tab | Types indentation as Tab keys so the editor applies its own indent style. Only leading indentation is converted. |
+| Auto Home on new line | Presses Home after each line break, so the file's own indentation is typed from column 0 instead of after the editor's auto-indent. |
+| Ctrl+Enter for new lines | Uses Ctrl+Enter ("insert line below" in VS Code and most IDEs), so auto-closed brackets and quotes are not pushed onto the next line. |
+| Pause when target loses focus | Pauses if another window becomes active. When off, Ghost Coder takes focus back before typing. |
+| Refocus target on resume | Brings the target window to the front when resuming, for example after clicking Resume in Ghost Coder. |
+
+## Markers
+
+Put markers in the source file to control playback. Markers are case-insensitive; counts use `=` or `:` (`<<DOWN=3>>` or `<<DOWN:3>>`).
+
+| Marker | Action |
+| --- | --- |
+| `<<PAUSE>>` | Pause playback here (resume with your hotkey). |
+| `<<PAUSE=1.5>>` | Wait 1.5 seconds, then continue. |
+| `<<ENTER>>`, `<<TAB>>`, `<<SPACE>>`, `<<ESC>>` | Press the key (a plain Enter, without the newline options). |
+| `<<BACKSPACE=3>>`, `<<DELETE>>`, `<<INSERT>>` | Editing keys, optionally repeated. |
+| `<<UP>>` `<<DOWN=10>>` `<<LEFT>>` `<<RIGHT>>` | Arrow keys (`UP_ARROW` and similar also work). |
+| `<<HOME>>`, `<<END>>`, `<<PAGEUP>>`, `<<PAGEDOWN>>`, `<<F1>>`…`<<F20>>` | Navigation and function keys. |
+| `<<CTRL+S>>`, `<<CTRL+SHIFT+P>>`, `<<ALT+TAB>>`, `<<WIN+E>>` | Key combinations (modifiers: CTRL, ALT, SHIFT, WIN). |
+| `<<SCROLLUP=5>>`, `<<SCROLLDOWN=3>>` | Scroll the mouse wheel. |
+
+Anything that looks like a marker but isn't a valid one is typed literally, so code like `cout << x;` or `a<<b>>c` plays back correctly.
+
+## Command-line options
+
+```text
+ghost-coder [--port PORT] [--logging] [--extbroker HOST:PORT] [--version]
 ```
 
-2. Select a source code file to playback
-3. Adjust playback speed and settings as needed
-4. Click on the text editor/IDE window where you want the code to appear
-5. Click "PLAY" or use your configured hotkey to start playback
+- `--port`: port for the internal MQTT broker (default: a random free port).
+- `--logging`: write debug logs to `%LOCALAPPDATA%\GhostCoder\logs\ghost_coder.log` and the console.
+- `--extbroker` / `--extmqtt`: use an external MQTT broker instead of the built-in one.
 
-### Hotkey Configuration
+## Files
 
-Right-click any control button to assign a global hotkey:
-- **Play/Pause/Resume**: Start or pause playback
-- **Stop**: Stop playback and reset to beginning
-- **Advance to Newline**: Skip to the next line
-- **Advance Token**: Skip to the next character/token
-
-Supports keyboard keys, mouse buttons, and gamepad controls.
-
-### Command-Line Options
-
-```bash
-ghost-coder [--port PORT] [--logging] [--extbroker HOST:PORT]
-```
-
-- `--port`: Specify MQTT broker port (default: random available port)
-- `--logging`: Enable detailed logging to `ghost_coder.log` and console
-- `--extbroker` or `--extmqtt`: Connect to external MQTT broker (format: `host:port`)
-
-## Configuration Options
-
-### Playback Settings
-
-- **Ghost Coding Speed**: Control typing speed (50-500ms per character)
-- **Auto Pause on New Line**: Automatically pause when reaching a new line
-- **Start Playback Paused**: Begin in paused mode, ready to advance manually
-- **Auto Home on Newline**: Press Home key at the start of each new line
-- **Ctrl on Newline**: Hold Ctrl when pressing Enter (useful for some IDEs)
-- **Replace Quad Spaces With Tab**: Convert 4 spaces to Tab key
-- **Pause Playback On App Focus Change**: Auto-pause when you switch windows
-- **Refocus Window On Resume**: Automatically return focus to target window when resuming
-- **Varied Coding Speed**: Add random variation (-50ms to +150ms) for realistic typing
-
-## Special Syntax
-
-Ghost Coder supports special syntax in your source files:
-
-- `<<PAUSE>>`: Force a pause at this point in playback
-- `<<SCROLL:UP:5>>`: Scroll up 5 times
-- `<<SCROLL:DOWN:3>>`: Scroll down 3 times
-- `<<DOWN:10>>`: Press down arrow 10 times
-- `<<ENTER:5>>`: Press Enter 5 times
+| Path | Contents |
+| --- | --- |
+| `%APPDATA%\GhostCoder\settings.json` | Options, dark mode and last opened file |
+| `%APPDATA%\GhostCoder\hotkeys.json` | Hotkey assignments |
+| `%LOCALAPPDATA%\GhostCoder\logs\ghost_coder.log` | Log file (only with `--logging`) |
 
 ## Architecture
 
-Ghost Coder uses a multi-process architecture with MQTT messaging:
+Ghost Coder runs four processes that talk over MQTT:
 
-- **Main UI Process**: NiceGUI-based interface running in native window mode
-- **Broker Process**: Internal MQTT broker for inter-process communication
-- **Listener Process**: Global input listener for hotkey detection
-- **Typer Process**: Automated text input simulator with window focus tracking
+- **UI** (`app.py`): NiceGUI native window. Sends commands and mirrors playback status.
+- **Broker** (`broker.py`): embedded amqtt broker on `127.0.0.1` (skipped with `--extbroker`).
+- **Listener** (`listener.py`): global keyboard/mouse/gamepad hooks for hotkey recording and triggering.
+- **Typer** (`typer.py`): parses the file and sends keystrokes to the target window. It is the single source of truth for playback status.
 
-This design ensures responsive UI and reliable hotkey detection while typing is in progress.
+| Topic | Messages |
+| --- | --- |
+| `TYPER` | UI → typer commands: `load_file`, `play`, `pause`, `resume`, `stop`, `advance_newline`, `advance_token` |
+| `STATE` | UI → typer settings (`state-data`); typer → UI `play_status` updates |
+| `UI` | typer → UI notifications, progress, countdown and target window |
+| `LISTENER` | UI → listener `register` / `restore` / `unregister` / `cancel`; listener → UI hotkey events |
+| `APP` | `CLOSE` shuts every process down |
 
-## Requirements
-
-- Python 3.13+
-- Windows OS (uses `pygetwindow` for window management)
-- Dependencies (automatically installed):
-  - nicegui >= 3.3.1
-  - pynput >= 1.8.1
-  - paho-mqtt >= 2.1.0
-  - inputs >= 0.5
-  - pygetwindow >= 0.0.9
-  - loguru >= 0.7.3
-  - pywebview >= 6.1
+Child processes exit on their own if the UI process dies.
 
 ## Development
 
-### Setting Up Development Environment
-
 ```bash
-# Clone the repository
-git clone https://github.com/sethstenzel/ghost-coder.git
-cd ghost-coder
-
-# Create virtual environment
-python -m venv .venv
-.venv\Scripts\activate  # Windows
-
-# Install in editable mode with dev dependencies
-pip install -e ".[dev]"
+uv sync --all-groups          # runtime, dev and build dependencies
+uv run pytest                 # unit tests
+uv run python -m ghost_coder --logging
 ```
 
-### Project Structure
+### Project structure
 
-```
+```text
 ghost-coder/
-├── src/
-│   └── ghost_coder/
-│       ├── app.py          # Main UI application
-│       ├── typer.py        # Automated typing engine
-│       ├── listener.py     # Global input listener
-│       ├── broker.py       # MQTT broker process
-│       ├── data.py         # Text parsing and token definitions
-│       ├── utils.py        # Utility functions
-│       └── hotkeys.json    # Saved hotkey configurations
-├── pyproject.toml          # Project configuration
-└── README.md
+├── src/ghost_coder/
+│   ├── app.py          # UI process and process management
+│   ├── typer.py        # playback engine
+│   ├── listener.py     # global hotkey listener
+│   ├── broker.py       # embedded MQTT broker
+│   ├── data.py         # source parser (text and markers -> tokens)
+│   ├── winutil.py      # Win32 focus helpers
+│   ├── utils.py        # paths, logging, ports
+│   └── assets/icon.ico
+├── packaging/
+│   ├── build.ps1       # wheel + Nuitka exe + NSIS installer
+│   ├── installer.nsi   # NSIS installer script
+│   ├── launcher.py     # Nuitka entry script
+│   └── run-dev.bat     # launch from the dev venv without a console
+└── tests/
 ```
+
+### Building the app and installer
+
+Requirements: [uv](https://docs.astral.sh/uv/), Visual Studio 2022 Build Tools (MSVC) and [NSIS](https://nsis.sourceforge.io/).
+
+```powershell
+./packaging/build.ps1             # dist/*.whl, build/nuitka/GhostCoder/GhostCoder.exe, dist/GhostCoder-Setup-<version>.exe
+./packaging/build.ps1 -Install    # also installs the result silently
+```
+
+Bump the version with `uvx bump-my-version bump patch|minor|major`.
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) file for details
+MIT License. See [LICENSE](LICENSE).
 
 ## Author
 
@@ -171,18 +193,9 @@ MIT License - see [LICENSE](LICENSE) file for details
 
 ## Links
 
-- **Homepage**: [https://github.com/sethstenzel/ghost-coder](https://github.com/sethstenzel/ghost-coder)
+- **Homepage / Repository**: [https://github.com/sethstenzel/ghost-coder](https://github.com/sethstenzel/ghost-coder)
 - **Issues**: [https://github.com/sethstenzel/ghost-coder/issues](https://github.com/sethstenzel/ghost-coder/issues)
-- **Repository**: [https://github.com/sethstenzel/ghost-coder](https://github.com/sethstenzel/ghost-coder)
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Acknowledgments
 
-Built with:
-- [NiceGUI](https://nicegui.io/) - Python UI framework
-- [pynput](https://pynput.readthedocs.io/) - Input control and monitoring
-- [Eclipse Paho](https://www.eclipse.org/paho/) - MQTT client
-- [inputs](https://inputs.readthedocs.io/) - Gamepad support
+Built with [NiceGUI](https://nicegui.io/), [pywebview](https://pywebview.flowrl.com/), [pynput](https://pynput.readthedocs.io/), [inputs](https://inputs.readthedocs.io/), [Eclipse Paho](https://www.eclipse.org/paho/) and [amqtt](https://github.com/Yakifo/amqtt).

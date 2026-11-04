@@ -24,3 +24,6 @@ hotkeys.json
 
 # editor
 .vscode
+# tests / tooling
+.pytest_cache/
+*.log

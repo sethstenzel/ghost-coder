@@ -1,206 +1,192 @@
+"""Parse a source file into playback tokens.
+
+Plain text is split into word-sized ``Text`` tokens (a word plus its trailing spaces), line
+breaks become ``Newline`` tokens and ``<<COMMAND>>`` markers become command tokens.
+
+Anything that looks like a marker but is not a valid command (for example C++ ``a<<b>>c``)
+is typed literally, so ordinary source code never gets swallowed by the parser.
+"""
+
 import re
-from typing import Tuple, Union
 from dataclasses import dataclass
+from typing import Optional, Union
 
-@dataclass
-class SingleKey:
-    key: str
-    
-    def __str__(self):
-        if self.key.upper() == "SPACE":
-            return ' '
-        return self.key.upper()
-
-@dataclass
-class MultiKeys:
-    keys: Tuple[str, ...]
-
-    def __str__(self):
-        return "+".join(self.keys).upper()
-
-@dataclass
-class TimedPause:
-    time: float
-
-    def __str__(self):
-        return f"PAUSE:{self.time}".upper()
+MAX_REPEAT = 1000
 
 
-@dataclass
-class MouseScroll:
-    scroll_count: int
-    scroll_direction: int
-
-    def __str__(self):
-        return f"SCROLL:C{self.scroll_count}|D{self.scroll_direction}".upper()
+@dataclass(frozen=True)
+class Text:
+    text: str
 
 
-@dataclass
-class RepeatedKey:
-    key: str
+@dataclass(frozen=True)
+class Newline:
+    pass
+
+
+@dataclass(frozen=True)
+class KeyPress:
+    key: str  # pynput Key attribute name
     count: int = 1
 
-    def __str__(self):
-        if self.count == 1:
-            return self.key.upper()
-        return f"{self.key.upper()}x{self.count}"
+
+@dataclass(frozen=True)
+class KeyCombo:
+    keys: tuple[str, ...]  # pynput Key attribute names or single characters
 
 
-class TextData():
-
-    def __init__(self, text_to_type="", replace_quad_spaces_with_tab=False):
-        self.original_text_to_type = text_to_type
-        self.replace_quad_spaces_with_tab = replace_quad_spaces_with_tab
-        self.text_tokens = self.parse_text_to_tokens(self.original_text_to_type)
+@dataclass(frozen=True)
+class TimedPause:
+    seconds: float
 
 
-    def parse_text_to_tokens(self, text):
-        string_tokens = self.text_to_string_tokens(text)
-        parsed_tokens = []
-        for string_token in string_tokens:
-            try:
-                command_token = self.parse_string_token_to_command_token(string_token)
-                parsed_tokens.append(command_token)
-            except ValueError:
-                parsed_tokens.append(string_token)
-        return parsed_tokens
+@dataclass(frozen=True)
+class PausePoint:
+    pass
 
 
-    def text_to_string_tokens(self, text):
-        if self.replace_quad_spaces_with_tab:
-            text = text.replace("    ", "\t")    
-        text = text.replace(" ", "<<space>>").replace("\n", "<<enter>>")
-        tokens = []
+@dataclass(frozen=True)
+class MouseScroll:
+    count: int
+    direction: int  # 1 = up, -1 = down
 
-        parts = re.split(f'({r'<<.*?>>'})', text)
-        tokens.extend([part for part in parts if part])
-        return tokens
 
-    def parse_string_token_to_command_token(self, string_token: str) -> Union[SingleKey, MultiKeys, TimedPause, RepeatedKey, MouseScroll]:
-        # Check for pause command with time value
-        pause_match = re.search(r"<<pause=(\d+)>>", string_token, re.IGNORECASE)
-        if pause_match:
-            return TimedPause(time=float(pause_match.group(1)))
+Token = Union[Text, Newline, KeyPress, KeyCombo, TimedPause, PausePoint, MouseScroll]
 
-        # Check for pause command without time value (creates atpause token)
-        if re.search(r"<<pause>>", string_token, re.IGNORECASE):
-            return SingleKey(key="atpause")
+# Marker names (case-insensitive) -> pynput Key attribute names.
+KEY_ALIASES: dict[str, str] = {
+    "enter": "enter", "return": "enter",
+    "tab": "tab",
+    "space": "space",
+    "backspace": "backspace", "bksp": "backspace",
+    "delete": "delete", "del": "delete",
+    "insert": "insert", "ins": "insert",
+    "home": "home",
+    "end": "end",
+    "pageup": "page_up", "page_up": "page_up", "pgup": "page_up",
+    "pagedown": "page_down", "page_down": "page_down", "pgdn": "page_down",
+    "esc": "esc", "escape": "esc",
+    "up": "up", "up_arrow": "up",
+    "down": "down", "down_arrow": "down",
+    "left": "left", "left_arrow": "left",
+    "right": "right", "right_arrow": "right",
+    "ctrl": "ctrl", "control": "ctrl",
+    "alt": "alt",
+    "shift": "shift",
+    "win": "cmd", "cmd": "cmd", "super": "cmd",
+    **{f"f{i}": f"f{i}" for i in range(1, 21)},
+}
 
-        # Check for scroll commands
-        scroll_up_match = re.search(r"<<scrollup=(\d+)>>", string_token)
-        if scroll_up_match:
-            return MouseScroll(scroll_count=int(scroll_up_match.group(1)), scroll_direction=1)
+MARKER_RE = re.compile(r"<<([^<>\s]{1,40})>>")
+COMMAND_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)(?:[=:](.+))?$")
+WORD_RE = re.compile(r"\S+[^\S\n]*|[^\S\n]+")
+LEADING_QUADS_RE = re.compile(r"^(?:    )+", re.MULTILINE)
 
-        scroll_down_match = re.search(r"<<scrolldown=(\d+)>>", string_token)
-        if scroll_down_match:
-            return MouseScroll(scroll_count=int(scroll_down_match.group(1)), scroll_direction=-1)
 
-        # Check for backspace commands: <<BACKSPACE>> or <<BACKSPACE=N>>
-        backspace_match = re.search(r"<<BACKSPACE(?:=(\d+))?>>" , string_token, re.IGNORECASE)
-        if backspace_match:
-            count = int(backspace_match.group(1)) if backspace_match.group(1) else 1
-            return RepeatedKey(key="backspace", count=count)
+def _parse_count(arg: Optional[str]) -> Optional[int]:
+    if arg is None:
+        return 1
+    if not arg.isdigit():
+        return None
+    count = int(arg)
+    return count if 1 <= count <= MAX_REPEAT else None
 
-        # Check for delete commands: <<DELETE>> or <<DELETE=N>>
-        delete_match = re.search(r"<<DELETE(?:=(\d+))?>>", string_token, re.IGNORECASE)
-        if delete_match:
-            count = int(delete_match.group(1)) if delete_match.group(1) else 1
-            return RepeatedKey(key="delete", count=count)
 
-        # Check for arrow key commands: <<UP_ARROW>> or <<UP_ARROW=N>>
-        up_arrow_match = re.search(r"<<UP_ARROW(?:=(\d+))?>>", string_token, re.IGNORECASE)
-        if up_arrow_match:
-            count = int(up_arrow_match.group(1)) if up_arrow_match.group(1) else 1
-            return RepeatedKey(key="up", count=count)
+def parse_marker(content: str) -> Optional[Token]:
+    """Parse the inside of a ``<<...>>`` marker. Returns None if it is not a valid command."""
+    if "+" in content and len(content) > 1:
+        if content.endswith("++"):
+            raw_parts = content[:-2].split("+") + ["+"]
+        else:
+            raw_parts = content.split("+")
+        keys = []
+        for part in raw_parts:
+            if not part:
+                return None
+            alias = KEY_ALIASES.get(part.lower())
+            if alias:
+                keys.append(alias)
+            elif len(part) == 1:
+                keys.append(part.lower())
+            else:
+                return None
+        return KeyCombo(tuple(keys)) if len(keys) >= 2 else None
 
-        down_arrow_match = re.search(r"<<DOWN_ARROW(?:=(\d+))?>>", string_token, re.IGNORECASE)
-        if down_arrow_match:
-            count = int(down_arrow_match.group(1)) if down_arrow_match.group(1) else 1
-            return RepeatedKey(key="down", count=count)
+    match = COMMAND_RE.match(content)
+    if not match:
+        return None
+    name, arg = match.group(1).lower(), match.group(2)
 
-        left_arrow_match = re.search(r"<<LEFT_ARROW(?:=(\d+))?>>", string_token, re.IGNORECASE)
-        if left_arrow_match:
-            count = int(left_arrow_match.group(1)) if left_arrow_match.group(1) else 1
-            return RepeatedKey(key="left", count=count)
+    if name == "pause":
+        if arg is None:
+            return PausePoint()
+        try:
+            seconds = float(arg)
+        except ValueError:
+            return None
+        return TimedPause(seconds) if 0 <= seconds <= 3600 else None
 
-        right_arrow_match = re.search(r"<<RIGHT_ARROW(?:=(\d+))?>>", string_token, re.IGNORECASE)
-        if right_arrow_match:
-            count = int(right_arrow_match.group(1)) if right_arrow_match.group(1) else 1
-            return RepeatedKey(key="right", count=count)
+    if name in ("scrollup", "scroll_up", "scrolldown", "scroll_down"):
+        count = _parse_count(arg)
+        if count is None:
+            return None
+        return MouseScroll(count=count, direction=1 if "up" in name else -1)
 
-        # Check for home key commands: <<HOME>> or <<HOME=N>>
-        home_match = re.search(r"<<HOME(?:=(\d+))?>>", string_token, re.IGNORECASE)
-        if home_match:
-            count = int(home_match.group(1)) if home_match.group(1) else 1
-            return RepeatedKey(key="home", count=count)
+    if name in KEY_ALIASES:
+        count = _parse_count(arg)
+        if count is None:
+            return None
+        return KeyPress(KEY_ALIASES[name], count)
 
-        # Check for end key commands: <<END>> or <<END=N>>
-        end_match = re.search(r"<<END(?:=(\d+))?>>", string_token, re.IGNORECASE)
-        if end_match:
-            count = int(end_match.group(1)) if end_match.group(1) else 1
-            return RepeatedKey(key="end", count=count)
+    return None
 
-        # Check for tab key commands: <<TAB>> or <<TAB=N>>
-        tab_match = re.search(r"<<TAB(?:=(\d+))?>>", string_token, re.IGNORECASE)
-        if tab_match:
-            count = int(tab_match.group(1)) if tab_match.group(1) else 1
-            return RepeatedKey(key="tab", count=count)
 
-        # Check for escape key commands: <<ESC>> or <<ESCAPE>>
-        if re.search(r"<<ESC(?:APE)?>>", string_token, re.IGNORECASE):
-            return SingleKey(key="esc")
+def _split_text(text: str, tokens: list[Token]) -> None:
+    """Split plain text into word-sized Text tokens and Newline tokens."""
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if i > 0:
+            tokens.append(Newline())
+        tokens.extend(Text(m.group(0)) for m in WORD_RE.finditer(line))
 
-        # Check for enter key commands: <<ENTER>>
-        if re.search(r"<<ENTER>>", string_token, re.IGNORECASE):
-            return SingleKey(key="enter")
 
-        # Check for general key patterns (must come last to avoid conflicts)
-        # Updated to include special characters like backtick, tilde, brackets, etc.
-        key_match = re.search(r"<<([^<>]+)>>", string_token)
-        if key_match:
-            keys = tuple(key_match.group(1).split('+'))
+def parse(text: str, replace_quad_spaces_with_tab: bool = False) -> list[Token]:
+    """Parse source text into a list of playback tokens."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if replace_quad_spaces_with_tab:
+        text = LEADING_QUADS_RE.sub(lambda m: "\t" * (len(m.group(0)) // 4), text)
 
-            # Map common key names to pynput Key names
-            key_mapping = {
-                'ctrl': 'ctrl',
-                'control': 'ctrl',
-                'alt': 'alt',
-                'shift': 'shift',
-                'win': 'cmd',  # Windows key maps to cmd in pynput
-                'cmd': 'cmd',
-                'super': 'cmd',
-                'esc': 'esc',
-                'escape': 'esc',
-                'enter': 'enter',
-                'return': 'enter',
-                'tab': 'tab',
-                'space': 'space',
-                'backspace': 'backspace',
-                'delete': 'delete',
-                'del': 'delete',
-                'home': 'home',
-                'end': 'end',
-                'pageup': 'page_up',
-                'pagedown': 'page_down',
-                'up': 'up',
-                'down': 'down',
-                'left': 'left',
-                'right': 'right',
-                'f1': 'f1', 'f2': 'f2', 'f3': 'f3', 'f4': 'f4',
-                'f5': 'f5', 'f6': 'f6', 'f7': 'f7', 'f8': 'f8',
-                'f9': 'f9', 'f10': 'f10', 'f11': 'f11', 'f12': 'f12',
-            }
+    tokens: list[Token] = []
+    pending = []  # literal text accumulated between valid markers
+    pos = 0
+    for m in MARKER_RE.finditer(text):
+        command = parse_marker(m.group(1))
+        if command is None:
+            continue
+        pending.append(text[pos:m.start()])
+        _split_text("".join(pending), tokens)
+        pending = []
+        tokens.append(command)
+        pos = m.end()
+    pending.append(text[pos:])
+    _split_text("".join(pending), tokens)
+    return tokens
 
-            # Normalize and map keys
-            normalized_keys = []
-            for key in keys:
-                key_lower = key.lower()
-                # Use mapping if available, otherwise use the key as-is (for regular characters)
-                mapped_key = key_mapping.get(key_lower, key_lower)
-                normalized_keys.append(mapped_key)
 
-            if len(normalized_keys) == 1:
-                return SingleKey(key=normalized_keys[0])
-            return MultiKeys(keys=tuple(normalized_keys))
-
-        raise ValueError("Invalid format")
+def describe(token: Token) -> str:
+    """Short human readable form, used for logging."""
+    if isinstance(token, Text):
+        return repr(token.text)
+    if isinstance(token, Newline):
+        return "<newline>"
+    if isinstance(token, KeyPress):
+        return f"<{token.key}x{token.count}>"
+    if isinstance(token, KeyCombo):
+        return "<" + "+".join(token.keys) + ">"
+    if isinstance(token, TimedPause):
+        return f"<pause {token.seconds}s>"
+    if isinstance(token, PausePoint):
+        return "<pause>"
+    if isinstance(token, MouseScroll):
+        return f"<scroll {'up' if token.direction > 0 else 'down'} x{token.count}>"
+    return str(token)

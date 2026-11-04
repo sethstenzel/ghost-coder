@@ -1,99 +1,70 @@
+"""Embedded MQTT broker (amqtt) used for communication between Ghost Coder processes."""
+
 import asyncio
 import json
-from loguru import logger
+import logging
+
+import paho.mqtt.client as mqtt
 from amqtt.broker import Broker
-import paho.mqtt.client as Client
+from loguru import logger
+
+from ghost_coder.utils import setup_logging, start_parent_watchdog, unique_client_id
 
 
-def broker_process(broker_host, available_port, enable_logging=True):
+def broker_process(broker_host: str, port: int, enable_logging: bool = False) -> None:
+    """Run an embedded MQTT broker until a CLOSE message arrives on the APP topic."""
+    setup_logging(enable_logging)
+    # amqtt logs via stdlib logging; keep it quiet unless debugging (e.g. the startup port probe).
+    logging.getLogger("amqtt").setLevel(logging.WARNING if enable_logging else logging.CRITICAL)
 
-    broker_config = {
-        "listeners": {
-            "default": {
-                "type": "tcp",
-                "bind": f"{broker_host}:{available_port}",
-            }
-        },
+    config = {
+        "listeners": {"default": {"type": "tcp", "bind": f"{broker_host}:{port}"}},
+        # Local-only IPC broker: anonymous auth, no $SYS topics or packet logging.
+        "plugins": {"amqtt.plugins.authentication.AnonymousAuthPlugin": {"allow_anonymous": True}},
     }
 
-    """Run an embedded MQTT broker in its own process."""
-    if enable_logging:
-        logger.configure(
-            handlers=[
-                {
-                    "sink": "ghost_coder.log",
-                    "format": "[{time:YYYY-MM-DD HH:mm:ss}] {level} {name}:{function}:{line} - {message}",
-                    "rotation": "10 MB",
-                    "retention": "7 days",
-                    "level": "DEBUG"
-                },
-                {
-                    "sink": lambda msg: print(msg, end=""),
-                    "format": "[{time:YYYY-MM-DD HH:mm:ss}] {level} {name}:{function}:{line} - {message}",
-                    "level": "DEBUG"
-                }
-            ]
-        )
-        logger.enable("ghost_coder")
-    else:
-        logger.disable("ghost_coder")
-    
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-
-    broker = Broker(broker_config, loop=loop)
+    broker = Broker(config, loop=loop)
     shutdown_event = asyncio.Event()
-    mqtt_client = None
+
+    def request_shutdown():
+        loop.call_soon_threadsafe(shutdown_event.set)
 
     def on_message(client, userdata, message):
-        """Handle incoming MQTT messages."""
         try:
             payload = json.loads(message.payload.decode())
-        except json.JSONDecodeError:
-            logger.warning(f"Received non-JSON message on {message.topic}: {message.payload.decode()}")
+        except (UnicodeDecodeError, json.JSONDecodeError):
             return
-        
-        if message.topic == "BROKER" and payload.get("command") == "SHUTDOWN":
-            logger.info("Received SHUTDOWN command")
-            # Send CLOSE message to APP topic before shutting down
-            close_msg = json.dumps({"command": "CLOSE"})
-            client.publish("APP", close_msg, qos=0)
-            logger.info("Sent CLOSE message to APP topic")
-            # Schedule shutdown after a brief delay to allow message delivery
-            async def delayed_shutdown():
-                await asyncio.sleep(0.5)
-                shutdown_event.set()
-            asyncio.run_coroutine_threadsafe(delayed_shutdown(), loop)
+        if isinstance(payload, dict) and "CLOSE" in (payload.get("command"), payload.get("cmd")):
+            logger.info("Broker received CLOSE; shutting down shortly")
+            # Give the other processes a moment to receive the CLOSE message too.
+            loop.call_soon_threadsafe(loop.call_later, 0.5, shutdown_event.set)
 
-        if message.topic == "APP" and payload.get("command") == "CLOSE":
-            logger.info("Received SHUTDOWN command")
-            loop.call_soon_threadsafe(shutdown_event.set)
-
-    async def start_broker():
-        nonlocal mqtt_client
+    async def run():
         await broker.start()
-        logger.info(f"Broker ready and accepting connections on {broker_host}:{available_port}")
-        
-        # Create a client to subscribe to the BROKER topic
-        mqtt_client = Client.Client(Client.CallbackAPIVersion.VERSION1, "broker_listener")
-        mqtt_client.on_message = on_message
-        mqtt_client.connect(broker_host, available_port)
-        mqtt_client.subscribe([
-            ("BROKER", 0),
-            ("APP", 0),
-        ])
-        mqtt_client.loop_start()
-        
-        # Wait for shutdown event
-        await shutdown_event.wait()
-        mqtt_client.loop_stop()
-        mqtt_client.disconnect()
+        logger.info(f"Broker accepting connections on {broker_host}:{port}")
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, unique_client_id("broker"))
+        client.on_message = on_message
+        client.connect(broker_host, port)
+        client.subscribe("APP", qos=0)
+        client.loop_start()
+        try:
+            await shutdown_event.wait()
+        finally:
+            client.loop_stop()
+            client.disconnect()
 
+    start_parent_watchdog(request_shutdown)
     try:
-        loop.run_until_complete(start_broker())
-    except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt, shutting Broker down…")
+        loop.run_until_complete(run())
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
     finally:
-        loop.run_until_complete(broker.shutdown())
+        try:
+            loop.run_until_complete(broker.shutdown())
+        except (Exception, asyncio.CancelledError) as e:
+            # In-flight QoS1 deliveries to already-disconnected clients get cancelled here.
+            logger.debug(f"Broker shutdown: {e!r}")
         loop.close()
-        logger.info("Broker Stopped")
+        logger.info("Broker stopped")
