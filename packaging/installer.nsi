@@ -36,14 +36,14 @@ VIAddVersionKey "FileDescription" "${APP_NAME} Installer"
 VIAddVersionKey "CompanyName" "${PUBLISHER}"
 VIAddVersionKey "LegalCopyright" "MIT License, ${PUBLISHER}"
 
-!define MUI_ICON "${__FILEDIR__}\..\src\ghost_coder\assets\icon.ico"
-!define MUI_UNICON "${__FILEDIR__}\..\src\ghost_coder\assets\icon.ico"
+!define MUI_ICON "..\src\ghost_coder\assets\icon.ico"
+!define MUI_UNICON "..\src\ghost_coder\assets\icon.ico"
 !define MUI_ABORTWARNING
 !define MUI_FINISHPAGE_RUN "$INSTDIR\${APP_EXE}"
 !define MUI_FINISHPAGE_RUN_TEXT "Launch ${APP_NAME}"
 
 !insertmacro MUI_PAGE_WELCOME
-!insertmacro MUI_PAGE_LICENSE "${__FILEDIR__}\..\LICENSE"
+!insertmacro MUI_PAGE_LICENSE "..\LICENSE"
 !insertmacro MUI_PAGE_COMPONENTS
 !define MUI_PAGE_CUSTOMFUNCTION_LEAVE EnsureAppSubdir
 !insertmacro MUI_PAGE_DIRECTORY
@@ -74,7 +74,7 @@ Section "!${APP_NAME}" SecApp
   RMDir /r "$INSTDIR"
   SetOutPath "$INSTDIR"
   File /r "${SOURCE_DIR}\*.*"
-  File "/oname=LICENSE.txt" "${__FILEDIR__}\..\LICENSE"
+  File "/oname=LICENSE.txt" "..\LICENSE"
 
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   CreateShortcut "$SMPROGRAMS\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}"

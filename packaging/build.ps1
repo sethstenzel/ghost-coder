@@ -20,7 +20,7 @@ Set-Location $root
 
 $version = (Select-String -Path 'src/ghost_coder/__init__.py' -Pattern '__version__ = "(.+)"').Matches[0].Groups[1].Value
 $nuitkaOut = Join-Path $root 'build/nuitka'
-$appDir = Join-Path $nuitkaOut 'GhostCoder'
+$appDir = Join-Path $nuitkaOut 'GhostCoder.dist'
 Write-Host "Building Ghost Coder $version" -ForegroundColor Cyan
 
 uv sync --all-groups
@@ -39,9 +39,9 @@ if (-not $SkipExe) {
         '--assume-yes-for-downloads',
         '--msvc=latest',
         "--jobs=$([Environment]::ProcessorCount)",
-        '--enable-plugin=pywebview',
         '--include-package=ghost_coder',
         '--include-package-data=ghost_coder',
+        '--include-package-data=nicegui',   # templates, element .js/.vue files and static assets
         '--include-package=amqtt',          # broker plugins are imported by dotted name
         '--include-distribution-metadata=amqtt',
         '--include-package=pynput',         # platform backend is imported dynamically
