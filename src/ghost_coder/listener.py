@@ -15,7 +15,6 @@ Synthetic (injected) keyboard/mouse events are ignored, so keystrokes produced b
 can never trigger a hotkey.
 """
 
-import importlib
 import json
 import threading
 import time
@@ -23,16 +22,16 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
 
-import inputs
 import paho.mqtt.client as mqtt
 from loguru import logger
 from pynput import keyboard, mouse
 
+from ghost_coder.gamepad import GAMEPAD_NAME, XInputPoller
 from ghost_coder.utils import setup_logging, start_parent_watchdog, unique_client_id
 
 SLOTS = range(1, 9)
 RECORD_TIMEOUT = 15.0
-TRIGGER_THRESHOLD = 128  # analog triggers report 0-255
+GAMEPAD_POLL_INTERVAL = 0.01  # 100 Hz
 REJECTED_MOUSE_BUTTONS = {"left"}  # a left-click hotkey would fire on every click
 
 
@@ -48,17 +47,6 @@ class Hotkey:
     source: InputSource
     value: str
     gamepad_name: Optional[str] = None
-
-
-def list_gamepads(refresh: bool = True) -> list[str]:
-    """Names of connected gamepads. Reloading `inputs` re-enumerates hot-plugged devices."""
-    global inputs
-    if refresh:
-        try:
-            inputs = importlib.reload(inputs)
-        except Exception as e:
-            logger.debug(f"Gamepad refresh failed: {e}")
-    return [getattr(dev, "name", f"Gamepad {i + 1}") for i, dev in enumerate(inputs.devices.gamepads)]
 
 
 class Listener:
@@ -85,6 +73,7 @@ class Listener:
 
         self._keyboard_listener: Optional[keyboard.Listener] = None
         self._mouse_listener: Optional[mouse.Listener] = None
+        self._gamepads = XInputPoller()
 
     # ------------------------------------------------------------------ MQTT
 
@@ -136,7 +125,7 @@ class Listener:
         if slot not in SLOTS:
             self.emit({"event": "hotkey_registration_error", "slot": slot, "error": f"Invalid slot {slot}"})
             return
-        if source_enum == InputSource.GAMEPAD and not list_gamepads():
+        if source_enum == InputSource.GAMEPAD and not self._gamepads.connected():
             self.emit({"event": "hotkey_registration_error", "slot": slot, "source": source, "error": "No gamepad connected"})
             return
         with self._lock:
@@ -177,7 +166,7 @@ class Listener:
         if error is None and (slot not in SLOTS or not value):
             error = "Invalid saved hotkey"
         if error is None and source_enum == InputSource.GAMEPAD:
-            pads = list_gamepads()
+            pads = self._gamepads.connected()
             if gamepad_name and gamepad_name not in pads:
                 error = f"Gamepad '{gamepad_name}' not connected"
             elif not pads:
@@ -299,37 +288,18 @@ class Listener:
 
     # ------------------------------------------------------------- gamepad
 
-    def _gamepad_event(self, event) -> None:
-        name = getattr(event.device, "name", None)
-        code, state = event.code, event.state
-        if event.ev_type == "Key":
-            self._on_input(InputSource.GAMEPAD, code, state != 0, name)
-        elif event.ev_type == "Absolute":
-            if code.startswith("ABS_HAT"):
-                # D-pad: -1/1 while held, 0 on release (release applies to both directions).
-                if state == 0:
-                    self._on_input(InputSource.GAMEPAD, f"{code}-", False, name)
-                    self._on_input(InputSource.GAMEPAD, f"{code}+", False, name)
-                else:
-                    self._on_input(InputSource.GAMEPAD, f"{code}{'+' if state > 0 else '-'}", True, name)
-            elif code in ("ABS_Z", "ABS_RZ"):
-                self._on_input(InputSource.GAMEPAD, code, state > TRIGGER_THRESHOLD, name)
-            # Analog sticks are ignored: they drift and would register spuriously.
-
     def _gamepad_loop(self) -> None:
-        last_refresh = 0.0
+        if not self._gamepads.available:
+            logger.warning("XInput not available; gamepad hotkeys disabled")
+            return
         while self._running.is_set():
             try:
-                if not inputs.devices.gamepads:
-                    raise inputs.UnpluggedError()
-                for event in inputs.get_gamepad():
-                    self._gamepad_event(event)
+                for value, pressed in self._gamepads.poll():
+                    self._on_input(InputSource.GAMEPAD, value, pressed, GAMEPAD_NAME)
             except Exception:
-                # No gamepad (or it was unplugged): poll for hot-plugged devices every few seconds.
-                time.sleep(0.5)
-                if time.monotonic() - last_refresh > 3:
-                    last_refresh = time.monotonic()
-                    list_gamepads()
+                logger.exception("Gamepad polling error")
+                time.sleep(1)
+            time.sleep(GAMEPAD_POLL_INTERVAL)
 
     # ----------------------------------------------------------- lifecycle
 

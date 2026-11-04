@@ -29,14 +29,16 @@ LEGACY_HOTKEYS_FILE = Path(__file__).parent / "hotkeys.json"
 
 SLOT_NAMES = {1: "Play / Pause / Resume", 2: "Stop", 3: "Advance to Newline", 4: "Advance Token"}
 
+# File extension -> CodeMirror language name (highlighting runs in the browser, not the UI event loop).
 LANGUAGES = {
-    ".py": "python", ".pyw": "python", ".js": "javascript", ".mjs": "javascript", ".ts": "typescript",
-    ".tsx": "tsx", ".jsx": "jsx", ".java": "java", ".c": "c", ".h": "c", ".cpp": "cpp", ".cc": "cpp",
-    ".hpp": "cpp", ".cs": "csharp", ".go": "go", ".rs": "rust", ".rb": "ruby", ".php": "php",
-    ".html": "html", ".htm": "html", ".css": "css", ".scss": "scss", ".json": "json", ".yaml": "yaml",
-    ".yml": "yaml", ".toml": "toml", ".md": "markdown", ".sh": "bash", ".ps1": "powershell",
-    ".sql": "sql", ".kt": "kotlin", ".swift": "swift", ".lua": "lua", ".bat": "batch",
+    ".py": "Python", ".pyw": "Python", ".js": "JavaScript", ".mjs": "JavaScript", ".ts": "TypeScript",
+    ".tsx": "TSX", ".jsx": "JSX", ".java": "Java", ".c": "C", ".h": "C", ".cpp": "C++", ".cc": "C++",
+    ".hpp": "C++", ".cs": "C#", ".go": "Go", ".rs": "Rust", ".rb": "Ruby", ".php": "PHP",
+    ".html": "HTML", ".htm": "HTML", ".css": "CSS", ".scss": "SCSS", ".json": "JSON", ".yaml": "YAML",
+    ".yml": "YAML", ".toml": "TOML", ".md": "Markdown", ".sh": "Shell", ".ps1": "PowerShell",
+    ".sql": "SQL", ".kt": "Kotlin", ".swift": "Swift", ".lua": "Lua",
 }
+PREVIEW_THEMES = {False: "vscodeLight", True: "vscodeDark"}
 
 SETTINGS: dict[str, Any] = {**DEFAULT_SETTINGS, "dark_mode": False, "last_file": ""}
 
@@ -355,22 +357,41 @@ def load_source_file(path: str, announce: bool = True) -> None:
         ui.notify(f"Loaded {Path(path).name}")
 
 
+def file_signature(path: str) -> Optional[tuple]:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return os.path.abspath(path), st.st_mtime_ns, st.st_size
+
+
 def show_preview(path: str, content: str) -> None:
-    container = UI.get("preview_container")
-    if container is None:
+    editor = UI.get("preview")
+    if editor is None:
         return
-    container.clear()
-    language = LANGUAGES.get(Path(path).suffix.lower(), "text")
-    with container:
-        ui.code(content.replace("```", "``​`"), language=language).classes("w-full")
+    editor.set_language(LANGUAGES.get(Path(path).suffix.lower()))
+    editor.set_value(content)
+    editor.update()
+    UI["preview_signature"] = file_signature(path)
 
 
 def refresh_preview() -> None:
+    """Re-read the source into the preview, unless the file is unchanged since it was last shown."""
     path = STATE["source_file_path"]
-    if path:
-        content = read_source(path)
-        if content is not None:
-            show_preview(path, content)
+    if not path or (UI.get("preview") is not None and UI.get("preview_signature") == file_signature(path)):
+        return
+    content = read_source(path)
+    if content is not None:
+        show_preview(path, content)
+
+
+def set_dark_mode(dark, value: bool) -> None:
+    dark.set_value(value)
+    set_setting("dark_mode", value)
+    editor = UI.get("preview")
+    if editor is not None:
+        editor.set_theme(PREVIEW_THEMES[value])
+        editor.update()
 
 
 async def choose_file() -> None:
@@ -617,13 +638,16 @@ def build_ui() -> None:
             ui.separator().classes("my-2")
             with ui.row().classes("items-center gap-4"):
                 ui.switch("Dark mode", value=bool(SETTINGS["dark_mode"]),
-                          on_change=lambda e: (dark.set_value(e.value), set_setting("dark_mode", bool(e.value))))
+                          on_change=lambda e: set_dark_mode(dark, bool(e.value)))
                 ui.label(f"v{__version__}").classes("text-xs opacity-60")
 
         with ui.column().classes("p-2 pl-4 gap-2").style(
                 "width: 55%; height: calc(100vh - 2rem); border-left: 2px solid #8884"):
             ui.label("Source preview").classes("font-bold text-xl")
-            UI["preview_container"] = ui.column().classes("w-full grow overflow-auto text-xs no-wrap")
+            UI["preview"] = ui.codemirror(theme=PREVIEW_THEMES[bool(SETTINGS["dark_mode"])]).classes(
+                "w-full grow").style("height: auto; min-height: 0; font-size: 12px")
+            UI["preview"].disable()  # read-only
+            UI["preview_signature"] = None
 
     update_hotkey_labels()
     update_status()

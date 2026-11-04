@@ -198,4 +198,4 @@ MIT License. See [LICENSE](LICENSE).
 
 ## Acknowledgments
 
-Built with [NiceGUI](https://nicegui.io/), [pywebview](https://pywebview.flowrl.com/), [pynput](https://pynput.readthedocs.io/), [inputs](https://inputs.readthedocs.io/), [Eclipse Paho](https://www.eclipse.org/paho/) and [amqtt](https://github.com/Yakifo/amqtt).
+Built with [NiceGUI](https://nicegui.io/), [pywebview](https://pywebview.flowrl.com/), [pynput](https://pynput.readthedocs.io/), [Eclipse Paho](https://www.eclipse.org/paho/) and [amqtt](https://github.com/Yakifo/amqtt).

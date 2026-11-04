@@ -94,3 +94,62 @@ def test_focus_loss_pauses(t, monkeypatch):
     t._resume()
     assert wait_for(lambda: t.status == "paused")
     assert typed(t) == "ab<enter>cd<enter>"
+
+
+class TimedKb(FakeKb):
+    def __init__(self):
+        super().__init__()
+        self.times = []
+
+    def press(self, key):
+        self.times.append(time.monotonic())
+        super().press(key)
+
+
+@pytest.mark.parametrize("speed_ms", [50, 200])
+def test_keystroke_interval_matches_speed_setting(t, tmp_path, speed_ms):
+    src = tmp_path / "timing.txt"
+    src.write_text("abcdefgh", encoding="utf-8")
+    t._load_file(str(src))
+    t.kb = TimedKb()
+    t.settings["typing_speed_value"] = speed_ms
+    t._play()
+    assert wait_for(lambda: t.status == "stopped")
+    gaps = [b - a for a, b in zip(t.kb.times, t.kb.times[1:])]
+    assert len(gaps) == 7
+    mean = sum(gaps) / len(gaps)
+    assert abs(mean - speed_ms / 1000) < 0.004, gaps
+
+
+def test_stop_interrupts_long_pause_promptly(t, tmp_path):
+    src = tmp_path / "pause.txt"
+    src.write_text("a<<PAUSE=30>>b", encoding="utf-8")
+    t._load_file(str(src))
+    before = set(threading.enumerate())
+    t._play()
+    sessions = [th for th in set(threading.enumerate()) - before if th.name.startswith("playback-")]
+    assert len(sessions) == 1
+    assert wait_for(lambda: typed(t) == "a")
+    time.sleep(0.05)
+    started = time.monotonic()
+    t._stop_playback()
+    for th in sessions:
+        th.join(timeout=1)
+    assert all(not th.is_alive() for th in sessions)
+    assert time.monotonic() - started < 0.1
+    assert typed(t) == "a"
+
+
+def test_tokens_parsed_once_until_file_changes(t, tmp_path, monkeypatch):
+    calls = []
+    real_parse = typer_mod.parse
+    monkeypatch.setattr(typer_mod, "parse", lambda *a, **k: calls.append(1) or real_parse(*a, **k))
+    src = tmp_path / "cache.txt"
+    src.write_text("one", encoding="utf-8")
+    first = t._read_tokens(str(src))
+    assert t._read_tokens(str(src)) is first
+    t.settings["replace_quad_spaces_with_tab"] = not t.settings["replace_quad_spaces_with_tab"]
+    t._read_tokens(str(src))
+    src.write_text("one two", encoding="utf-8")
+    assert len(t._read_tokens(str(src))) == 2
+    assert len(calls) == 3

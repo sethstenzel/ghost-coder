@@ -14,6 +14,7 @@ the status it reports back.
 """
 
 import json
+import os
 import random
 import threading
 import time
@@ -45,6 +46,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 }
 
 PROGRESS_INTERVAL = 0.2
+# Condition/lock waits on Windows round up to the ~15.6 ms system tick; time.sleep does not.
+# Sleeps wait on the condition (so stop/pause wake them at once) until this close to the
+# deadline, then finish with time.sleep for accurate keystroke timing.
+FINE_SLEEP = 0.025
 
 
 class Cancelled(Exception):
@@ -67,6 +72,7 @@ class Typer:
         self._refocus_pending = False
         self.hwnd = 0
         self._last_progress = 0.0
+        self._token_cache: Optional[tuple[tuple, list[Token]]] = None
 
         self.kb = KbController()
         self.ms = MsController()
@@ -154,9 +160,18 @@ class Typer:
             logger.warning(f"Typer unknown command: {cmd}")
 
     def _read_tokens(self, path: str) -> list[Token]:
+        """Parse the file, reusing the previous result while the file and parse options are unchanged."""
+        st = os.stat(path)
+        quads = bool(self.settings["replace_quad_spaces_with_tab"])
+        key = (os.path.abspath(path), st.st_mtime_ns, st.st_size, quads)
+        cache = self._token_cache
+        if cache and cache[0] == key:
+            return cache[1]
         with open(path, "r", encoding="utf-8-sig") as f:
             text = f.read()
-        return parse(text, replace_quad_spaces_with_tab=bool(self.settings["replace_quad_spaces_with_tab"]))
+        tokens = parse(text, replace_quad_spaces_with_tab=quads)
+        self._token_cache = (key, tokens)
+        return tokens
 
     def _load_file(self, path: Optional[str]) -> None:
         if not path:
@@ -247,13 +262,21 @@ class Typer:
 
     def _sleep(self, session: int, seconds: float) -> None:
         """Interruptible sleep."""
-        end = time.monotonic() + seconds
-        while True:
-            self._check(session)
-            remaining = end - time.monotonic()
-            if remaining <= 0:
-                return
-            time.sleep(min(remaining, 0.05))
+        self._sleep_until(session, time.monotonic() + seconds)
+
+    def _sleep_until(self, session: int, deadline: float) -> None:
+        """Sleep until a time.monotonic() deadline; raises Cancelled as soon as the session ends."""
+        with self._lock:
+            while True:
+                self._check(session)
+                remaining = deadline - time.monotonic()
+                if remaining <= FINE_SLEEP:
+                    break
+                self._wake.wait(remaining - FINE_SLEEP)
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+        self._check(session)
 
     def _gate(self, session: int) -> None:
         """Block until the next keystroke may be sent to the target window."""
@@ -304,23 +327,31 @@ class Typer:
         finally:
             self.kb.release(key)
 
-    def _type_char(self, session: int, char: str) -> None:
+    def _stroke(self, session: int, key, interval: Optional[float] = None) -> None:
+        """Tap one key and wait so that consecutive keystrokes start `interval` seconds apart.
+
+        The interval is measured from the start of the keystroke, so the key hold time and the
+        time spent sending input are part of it instead of being added on top.
+        """
+        if interval is None:
+            interval = self._speed_ms() / 1000
         self._gate(session)
-        key = Key.tab if char == "\t" else char
-        speed = self._speed_ms() / 1000
-        self._tap(key, hold=min(speed / 3, 0.03))
-        self._sleep(session, speed * 2 / 3)
+        started = time.monotonic()
+        self._tap(key, hold=min(interval / 3, 0.03))
+        self._sleep_until(session, started + interval)
+
+    def _type_char(self, session: int, char: str) -> None:
+        self._stroke(session, Key.tab if char == "\t" else char)
 
     def _press_named(self, session: int, name: str, count: int = 1) -> None:
         key = getattr(Key, name)
         for _ in range(count):
-            self._gate(session)
-            speed = self._speed_ms() / 1000
-            self._tap(key, hold=min(speed / 3, 0.03))
-            self._sleep(session, speed * 2 / 3)
+            self._stroke(session, key)
 
     def _combo(self, session: int, keys: tuple[str, ...]) -> None:
         self._gate(session)
+        interval = self._speed_ms() / 1000
+        started = time.monotonic()
         resolved = [getattr(Key, k) if len(k) > 1 else k for k in keys]
         pressed = []
         try:
@@ -331,19 +362,15 @@ class Typer:
         finally:
             for k in reversed(pressed):
                 self.kb.release(k)
-        self._sleep(session, self._speed_ms() / 1000)
+        self._sleep_until(session, started + interval)
 
     def _newline(self, session: int) -> None:
-        self._gate(session)
-        speed = self._speed_ms() / 1000
         if self.settings["control_on_newline"]:
             self._combo(session, ("ctrl", "enter"))
         else:
-            self._tap(Key.enter)
-            self._sleep(session, speed)
+            self._stroke(session, Key.enter)
         if self.settings["auto_home_on_newline"]:
-            self._tap(Key.home)
-            self._sleep(session, speed / 2)
+            self._stroke(session, Key.home, self._speed_ms() / 2000)
         with self._lock:
             self._check(session)
             if self._advance_newline:

@@ -1,6 +1,6 @@
 [project]
 name = "ghost-coder"
-version = "0.4.0"
+version = "0.4.1"
 description = "Automated code playback tool for creating coding tutorials and demo videos with hotkey-driven controls."
 readme = "README.md"
 requires-python = ">=3.13"
@@ -21,7 +21,6 @@ classifiers = [
 ]
 dependencies = [
     "amqtt>=0.11.3",
-    "inputs>=0.5",
     "loguru>=0.7.3",
     "nicegui>=3.3.1",
     "paho-mqtt>=2.1.0",
@@ -30,7 +29,7 @@ dependencies = [
 ]
 
 [project.scripts]
-ghost-coder = "ghost_coder.app:main"
+ghost-coder = "ghost_coder.__main__:main"
 
 [project.urls]
 Homepage = "https://github.com/sethstenzel/ghost-coder"
